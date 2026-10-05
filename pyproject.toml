@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "retopotool"
 version = "0.1.0"
-description = "Seam-preserving GLB decimation, normal-map bake and skin-preserving LOD ladders for game characters."
+description = "Seam-preserving GLB decimation, normal-map bake and LOD ladders for props, environment pieces and characters."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Laurent Bernier" }]

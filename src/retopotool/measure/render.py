@@ -18,9 +18,7 @@ import argparse
 import io
 
 import numpy as np
-from pygltflib import GLTF2
 
-from ..gltf_io import _acc
 
 # Y is up and Z is front (glTF convention, character facing +Z), so a front view looks down -Z and
 # the two screen axes are X and Y.
@@ -29,40 +27,32 @@ _LIGHT = np.array([0.30, 0.40, 0.86])
 
 
 def load_textured(path: str):
-    """Concatenated triangle geometry + the first material's base-colour image."""
+    """Concatenated textured triangle geometry in world space + the first base-colour image found
+    (a multi-material prop is drawn with that one texture — this is a before/after instrument)."""
     from PIL import Image
-    g = GLTF2().load(path)
-    blob = g.binary_blob()
-    P, UV, F = [], [], []
-    off = 0
-    for mesh in (g.meshes or []):
-        for prim in mesh.primitives:
-            at = prim.attributes
-            if at.POSITION is None or at.TEXCOORD_0 is None:
-                continue
-            p = _acc(g, blob, at.POSITION).astype(np.float64)
-            uv = _acc(g, blob, at.TEXCOORD_0)
-            if np.issubdtype(uv.dtype, np.integer):
-                uv = uv.astype(np.float64) / np.iinfo(uv.dtype).max
-            f = (_acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
-                 if prim.indices is not None else np.arange(len(p)).reshape(-1, 3))
-            P.append(p)
-            UV.append(uv.astype(np.float64))
-            F.append(f + off)
-            off += len(p)
-    if not P:
+    from ..bake_normals import _texture_image_index_compat
+    from ..gltf_io import concat_triangles, load_triangles
+    g, blob, prims = load_triangles(path)
+    prims = [p for p in prims if p["UV"] is not None]
+    if not prims:
         raise ValueError(f"{path}: no textured triangle primitive")
+    c = concat_triangles(prims, keys=("UV",))
     tex = np.ones((1, 1, 3)) * 0.8
-    mat = g.materials[0] if g.materials else None
-    pbr = mat.pbrMetallicRoughness if mat is not None else None
-    if pbr is not None and pbr.baseColorTexture is not None:
-        img = g.images[g.textures[pbr.baseColorTexture.index].source]
-        if img.bufferView is not None:
-            bv = g.bufferViews[img.bufferView]
-            o = bv.byteOffset or 0
-            im = Image.open(io.BytesIO(bytes(blob[o:o + bv.byteLength]))).convert("RGB")
-            tex = np.asarray(im, dtype=np.float64) / 255.0
-    return np.concatenate(P), np.concatenate(UV), np.concatenate(F), tex
+    for p in prims:
+        mat = g.materials[p["material"]] if (p["material"] is not None and g.materials) else None
+        pbr = mat.pbrMetallicRoughness if mat is not None else None
+        if pbr is None or pbr.baseColorTexture is None:
+            continue
+        ii = _texture_image_index_compat(g, pbr.baseColorTexture.index)
+        img = g.images[ii] if (ii is not None and g.images and ii < len(g.images)) else None
+        if img is None or img.bufferView is None:
+            continue
+        bv = g.bufferViews[img.bufferView]
+        o = bv.byteOffset or 0
+        im = Image.open(io.BytesIO(bytes(blob[o:o + bv.byteLength]))).convert("RGB")
+        tex = np.asarray(im, dtype=np.float64) / 255.0
+        break
+    return c["P"], c["UV"], c["F"], tex
 
 
 def _sample(tex: np.ndarray, uv: np.ndarray) -> np.ndarray:

@@ -29,6 +29,9 @@ open along every seam the moment it is posed.
 
     retopo measure fidelity --quality <one.glb>
     retopo measure fidelity --quality <rig.glb> <lod...>
+
+Pass `--prop` to report one region ("all") instead of the humanoid head / hands / body bands.
+Every triangle primitive is measured, placed by its node transform.
 """
 from __future__ import annotations
 
@@ -36,49 +39,50 @@ import os
 import sys
 
 import numpy as np
-from pygltflib import GLTF2
 
-from ..gltf_io import _acc
 
 
 def load(path):
-    g = GLTF2().load(path)
-    blob = g.binary_blob()
-    P = F = UV = N = TAN = None
-    for mesh in (g.meshes or []):
-        for prim in mesh.primitives:
-            if prim.attributes.POSITION is None:
-                continue
-            P = _acc(g, blob, prim.attributes.POSITION).astype(np.float64)
-            F = (_acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
-                 if prim.indices is not None else np.arange(len(P)).reshape(-1, 3))
-            for name, dst in (("TEXCOORD_0", "UV"), ("NORMAL", "N"), ("TANGENT", "TAN")):
-                idx = getattr(prim.attributes, name, None)
-                if idx is not None:
-                    v = _acc(g, blob, idx).astype(np.float64)
-                    if dst == "UV":
-                        UV = v
-                    elif dst == "N":
-                        N = v
-                    else:
-                        TAN = v
-            mat = g.materials[prim.material] if (prim.material is not None and g.materials) else None
-            nmap = None
-            if mat is not None and mat.normalTexture is not None:
-                from ..bake_normals import decode_image, _texture_image_index_compat
-                ii = _texture_image_index_compat(g, mat.normalTexture.index)
-                if ii is not None and g.images and ii < len(g.images):
-                    im = g.images[ii]
-                    if im.bufferView is not None:
-                        bv = g.bufferViews[im.bufferView]
-                        off = bv.byteOffset or 0
-                        nmap = decode_image(bytes(blob[off:off + bv.byteLength]))
-            return P, F, UV, N, TAN, nmap
-    raise SystemExit(f"no triangle geometry in {path}")
+    """All triangle primitives of the file in world space, concatenated. The normal map is used
+    only when every primitive samples the SAME one (one material, or materials sharing a map) —
+    with several, a per-vertex lookup would need a map per primitive, so shading is then compared
+    on the interpolated normals alone."""
+    from ..bake_normals import decode_image, _texture_image_index_compat
+    from ..gltf_io import concat_triangles, load_triangles
+    g, blob, prims = load_triangles(path)
+    if not prims:
+        raise SystemExit(f"no triangle geometry in {path}")
+    c = concat_triangles(prims)
+    imgs = set()
+    for p in prims:
+        mat = g.materials[p["material"]] if (p["material"] is not None and g.materials) else None
+        nt = mat.normalTexture if mat is not None else None
+        imgs.add(_texture_image_index_compat(g, nt.index) if nt is not None else None)
+    nmap = None
+    if len(imgs) == 1 and None not in imgs:
+        ii = imgs.pop()
+        if g.images and ii < len(g.images) and g.images[ii].bufferView is not None:
+            bv = g.bufferViews[g.images[ii].bufferView]
+            off = bv.byteOffset or 0
+            nmap = decode_image(bytes(blob[off:off + bv.byteLength]))
+    N = c["NORMAL"]
+    if N is None:
+        from ..bake_normals import _smooth_normals
+        N = _smooth_normals(c["P"], c["F"])
+    TAN = c["TANGENT"]
+    if TAN is None and nmap is not None and c["UV"] is not None:
+        # No tangents in the file: a renderer generates them, so the reference must too. Skipping
+        # the normal map instead compares a mapped output against an unmapped source.
+        from ..bake_normals import _tangents
+        TAN = _tangents(c["P"], c["F"], c["UV"], N)
+    return c["P"], c["F"], c["UV"], N, TAN, nmap
 
 
-def regions(P):
-    """Head / hands / body, the same bands the decimator's importance warp uses."""
+def regions(P, character=True):
+    """Head / hands / body, the same bands the decimator's importance warp uses — or, for a prop,
+    one region covering everything."""
+    if not character:
+        return {"all": np.ones(len(P), dtype=bool)}
     lo, hi = P.min(0), P.max(0)
     h = hi[1] - lo[1]
     head = P[:, 1] > lo[1] + 0.84 * h
@@ -88,33 +92,11 @@ def regions(P):
 
 def shaded_normals(Q, P, F, UV, N, TAN, nmap):
     """The normal the renderer will actually use at the surface point nearest each Q."""
-    import igl
-    _, fid, pts = igl.point_mesh_squared_distance(Q, P, F)
-    fid = np.asarray(fid, dtype=np.int64)
-    tri = P[F[fid]]
-    v0, v1, v2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], np.asarray(pts) - tri[:, 0]
-    d00, d01, d11 = (v0 * v0).sum(1), (v0 * v1).sum(1), (v1 * v1).sum(1)
-    d20, d21 = (v2 * v0).sum(1), (v2 * v1).sum(1)
-    den = np.where(np.abs(d00 * d11 - d01 * d01) < 1e-20, 1e-20, d00 * d11 - d01 * d01)
-    b = (d11 * d20 - d01 * d21) / den
-    c = (d00 * d21 - d01 * d20) / den
-    w = np.stack([1 - b - c, b, c], axis=1)
-    cor = F[fid]
-    n = (N[cor] * w[:, :, None]).sum(1)
-    n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20
-    if nmap is not None and TAN is not None and UV is not None:
-        from ..bake_normals import _sample_bilinear
-        t = (TAN[cor, :3] * w[:, :, None]).sum(1)
-        t -= n * (n * t).sum(1, keepdims=True)
-        t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-20
-        bt = np.cross(n, t) * np.sign((TAN[cor, 3] * w).sum(1))[:, None]
-        ts = _sample_bilinear(nmap, (UV[cor] * w[:, :, None]).sum(1)) * 2 - 1
-        n = t * ts[:, 0:1] + bt * ts[:, 1:2] + n * ts[:, 2:3]
-        n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20
-    return n
+    from ..bake_normals import shade_at
+    return shade_at(Q, P, F, UV, N, TAN, nmap)
 
 
-def quality_block(path):
+def quality_block(path, character=True):
     """Triangle shape + topology + skin-seam consistency for one file.
 
     These are the numbers point-to-surface distance cannot see. A sliver sits right ON the surface
@@ -123,11 +105,10 @@ def quality_block(path):
     """
     from ..mesh_quality import (topology_report, triangle_quality, triangle_quality_by_region,
                                 skin_discontinuity, dense_weights, weld_by_position)
-    g = GLTF2().load(path)
-    blob = g.binary_blob()
-    prim = g.meshes[0].primitives[0]
-    P = _acc(g, blob, prim.attributes.POSITION).astype(np.float64)
-    F = _acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
+    from ..gltf_io import concat_triangles, load_triangles
+    g, _, prims = load_triangles(path)
+    c = concat_triangles(prims)
+    P, F = c["P"], c["F"]
     Pw, Fw, _ = weld_by_position(P, F)
     t, q = topology_report(Pw, Fw, welded=True), triangle_quality(Pw, Fw)
     print(f"  topology  bnd={t['boundary_edges']} nonmanifold={t['nonmanifold_edges']} "
@@ -136,13 +117,13 @@ def quality_block(path):
     print(f"  shape     slivers<10deg={q['sliver_frac']*100:.2f}%  min-angle p5={q['min_angle_p5']:.2f}deg  "
           f"edge p50={q['edge_p50_mm']:.2f} p99={q['edge_p99_mm']:.2f} max={q['edge_max_mm']:.1f}mm  "
           f"max/p50={q['edge_max_over_p50']:.1f}")
-    for r, v in triangle_quality_by_region(Pw, Fw).items():
+    for r, v in (triangle_quality_by_region(Pw, Fw).items() if character else ()):
         print(f"    {r:6s} tris={v['triangles']:7d} slivers={v['sliver_frac']*100:5.2f}% "
               f"p5={v['min_angle_p5']:5.2f}deg maxedge={v['edge_max_mm']:6.1f}mm")
-    if not g.skins or getattr(prim.attributes, "JOINTS_0", None) is None:
+    if not g.skins or c["JOINTS_0"] is None or c["WEIGHTS_0"] is None:
         return
-    J = _acc(g, blob, prim.attributes.JOINTS_0).astype(np.int64)
-    W = _acc(g, blob, prim.attributes.WEIGHTS_0).astype(np.float64)
+    J = c["JOINTS_0"]
+    W = c["WEIGHTS_0"].astype(np.float64)
     W = W / np.maximum(W.sum(1, keepdims=True), 1e-12)
     nb = len(g.skins[0].joints)
     sd = skin_discontinuity(P, F, J, W, nb)
@@ -167,18 +148,21 @@ def main(argv=None) -> int:
     quality = "--quality" in argv
     if quality:
         argv.remove("--quality")
+    prop = "--prop" in argv
+    if prop:
+        argv.remove("--prop")
     if len(argv) < 1:
         raise SystemExit(__doc__)
     if quality and len(argv) == 1:
         print(f"{os.path.basename(argv[0])}")
-        quality_block(argv[0])
+        quality_block(argv[0], character=not prop)
         return 0
     if len(argv) < 2:
         raise SystemExit(__doc__)
     import igl
     src, cands = argv[0], argv[1:]
     Ps, Fs, UVs, Ns, TANs, NMs = load(src)
-    reg = regions(Ps)
+    reg = regions(Ps, character=not prop)
     rng = np.random.default_rng(0)
     sample = {k: rng.choice(np.where(m)[0], min(20000, int(m.sum())), replace=False)
               for k, m in reg.items() if m.sum() >= 64}
@@ -187,7 +171,7 @@ def main(argv=None) -> int:
           f"  normal map: {'yes' if NMs is not None else 'no'}")
     for cand in cands:
         P, F, UV, N, TAN, NM = load(cand)
-        cr = regions(P)
+        cr = regions(P, character=not prop)
         print(f"\n{os.path.basename(cand)}  {len(F):,} tris  {len(P):,} verts"
               f"  normal map: {'yes' if NM is not None else 'no'}")
         print(f"  {'region':6} {'share':>7} {'p2s p50':>9} {'p2s p95':>9} {'p2s max':>9}"
@@ -201,7 +185,7 @@ def main(argv=None) -> int:
             print(f"  {name:6} {share*100:6.1f}% {np.median(d):9.3f} {np.percentile(d,95):9.3f}"
                   f" {d.max():9.2f} {np.median(ang):10.2f}° {np.percentile(ang,95):10.2f}°")
         if quality:
-            quality_block(cand)
+            quality_block(cand, character=not prop)
     return 0
 
 

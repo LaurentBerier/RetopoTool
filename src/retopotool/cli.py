@@ -1,8 +1,8 @@
 """`retopo` command line.
 
     retopo stats IN.glb
-    retopo optimize IN.glb OUT.glb [--ratio R | --target-triangles N] [--no-bake]
-    retopo lod IN.glb OUT_DIR [--tier name:triangles:texture ...] [--no-bake]
+    retopo optimize IN.glb OUT.glb [--ratio R | --target-triangles N] [--profile P] [--no-bake]
+    retopo lod IN.glb OUT_DIR [--tier name:triangles|percent%[:texture] ...] [--profile P]
     retopo measure fidelity|uv-drift|render ...
 
 Results are printed to stdout as JSON; logs go to stderr (`-v` for progress).
@@ -37,13 +37,22 @@ def _print_json(obj) -> None:
 
 
 def _parse_tier(spec: str):
+    """`name:BUDGET[:texture_size]` where BUDGET is a triangle count (30000) or a percentage of
+    the source (25%)."""
     from .pipeline import LodTier
     try:
-        name, tris, tex = spec.split(":")
-        return LodTier(name, int(tris), int(tex))
+        bits = spec.split(":")
+        if len(bits) not in (2, 3):
+            raise ValueError
+        name, budget = bits[0], bits[1].strip()
+        tex = int(bits[2]) if len(bits) == 3 and bits[2] else None
+        if budget.endswith("%"):
+            return LodTier(name, ratio=float(budget[:-1]) / 100.0, texture_size=tex)
+        return LodTier(name, int(budget), tex)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"tier must be name:triangles:texture_size (e.g. low:30000:1024), got {spec!r}")
+            "tier must be name:triangles[:texture_size] or name:percent%[:texture_size] "
+            f"(e.g. low:30000:1024, lod2:25%), got {spec!r}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -63,17 +72,23 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--ratio", type=float, help="fraction of triangles to keep (0.05-0.95)")
     g.add_argument("--target-triangles", type=int, help="triangle budget (default 400000)")
     p.add_argument("--no-bake", action="store_true", help="skip the normal-map bake")
+    p.add_argument("--profile", choices=("prop", "character"), default="prop",
+                   help="density allocation: uniform (prop, default) or head/hands first "
+                        "(character, Y-up A/T-pose)")
     p.add_argument("--head-boost", type=float, help="head density boost (1.0 = off)")
     p.add_argument("--hand-boost", type=float, help="hand density boost (1.0 = off)")
 
-    p = sub.add_parser("lod", help="build a skin-preserving LOD ladder from a GLB")
+    p = sub.add_parser("lod", help="build an LOD ladder from a GLB (skin preserved if rigged)")
     p.add_argument("input")
     p.add_argument("out_dir")
-    p.add_argument("--tier", action="append", type=_parse_tier, metavar="NAME:TRIS:TEX",
-                   help="repeatable; default high:100000:2048 medium:60000:1024 "
-                        "low:30000:1024 minimum:15000:512")
+    p.add_argument("--tier", action="append", type=_parse_tier, metavar="NAME:BUDGET[:TEX]",
+                   help="repeatable; BUDGET is a triangle count or a percentage (25%%). Default: "
+                        "lod1:50%% lod2:25%% lod3:10%% for a static mesh, high:100000:2048 "
+                        "medium:60000:1024 low:30000:1024 minimum:15000:512 for a skinned one")
     p.add_argument("--stem", help="output file stem (default: the input's)")
     p.add_argument("--no-bake", action="store_true", help="skip the normal-map bake")
+    p.add_argument("--profile", choices=("auto", "prop", "character"), default="auto",
+                   help="density allocation (auto = character for a skinned GLB, prop otherwise)")
     p.add_argument("--head-boost", type=float, help="head density boost (1.0 = off)")
     p.add_argument("--hand-boost", type=float, help="hand density boost (1.0 = off)")
 
@@ -107,11 +122,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             _print_json(pipeline.optimize_glb(
                 a.input, a.output, ratio=a.ratio,
                 target_triangles=a.target_triangles or TARGET_TRIANGLES,
-                bake=not a.no_bake, head_boost=a.head_boost, hand_boost=a.hand_boost))
+                bake=not a.no_bake, profile=a.profile,
+                head_boost=a.head_boost, hand_boost=a.hand_boost))
         elif a.cmd == "lod":
             _print_json(pipeline.build_lod_ladder(
-                a.input, a.out_dir, a.tier or pipeline.DEFAULT_LOD_TIERS, stem=a.stem,
-                bake=not a.no_bake, head_boost=a.head_boost, hand_boost=a.hand_boost))
+                a.input, a.out_dir, a.tier or None, stem=a.stem, bake=not a.no_bake,
+                profile=a.profile, head_boost=a.head_boost, hand_boost=a.hand_boost))
     except (ValueError, FileNotFoundError) as exc:
         print(f"retopo: error: {exc}", file=sys.stderr)
         return 1

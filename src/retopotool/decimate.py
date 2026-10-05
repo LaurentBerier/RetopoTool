@@ -59,6 +59,10 @@ DENSE_TRIANGLE_THRESHOLD = 800_000
 # quality are deliberately decoupled.
 TARGET_TRIANGLES = 400_000
 
+class NothingToDecimate(ValueError):
+    """The file has no triangle primitive large enough to reduce (fewer than 64 faces)."""
+
+
 _KMAX = 16  # max seam-split candidates considered per welded vertex (typical splits are 2-4);
             # verts with more splits fall back to ancestor attributes via the island check
 
@@ -260,6 +264,9 @@ _HAND_X_FRAC = 0.75
 # own, so it was past the optimum even for the region it was protecting. The 400k Optimize step
 # keeps 3.0/2.0: budget is plentiful there and that rung is what the original face-detail
 # complaint was about.
+# Density-allocation profiles (see `_resolve_boosts`). Props are the default: the humanoid warp
+# only means something on a humanoid.
+PROFILES = ("auto", "prop", "character")
 _LOD_HEAD_BOOST = float(os.environ.get("RETOPO_LOD_HEAD_BOOST", "2.0"))
 _LOD_HAND_BOOST = float(os.environ.get("RETOPO_LOD_HAND_BOOST", "1.6"))
 
@@ -324,13 +331,24 @@ def _summarize_quality(density: List[Dict], plans: List[Dict]) -> Dict:
         return out
     try:
         from .mesh_quality import (topology_report, triangle_quality, weld_by_position)
-        P = np.concatenate([np.asarray(pl["pos"], dtype=np.float64) for pl in plans])
-        off, F = 0, []
+        # Welded PER MESH: the primitives of one mesh are one surface (a crack between two of its
+        # materials must show up as boundary edges), but two meshes are separate objects in their
+        # own local spaces and welding them together would invent non-manifold edges.
+        by_mesh: Dict = {}
         for pl in plans:
-            F.append(np.asarray(pl["faces"], dtype=np.int64) + off)
-            off += len(pl["pos"])
-        F = np.concatenate(F)
-        Pw, Fw, _ = weld_by_position(P, F)
+            by_mesh.setdefault(pl.get("key", (0, 0))[0], []).append(pl)
+        Ps, Fs, off = [], [], 0
+        for group in by_mesh.values():
+            P = np.concatenate([np.asarray(pl["pos"], dtype=np.float64) for pl in group])
+            o, F = 0, []
+            for pl in group:
+                F.append(np.asarray(pl["faces"], dtype=np.int64) + o)
+                o += len(pl["pos"])
+            Pw, Fw, _ = weld_by_position(P, np.concatenate(F))
+            Ps.append(Pw)
+            Fs.append(Fw + off)
+            off += len(Pw)
+        Pw, Fw = np.concatenate(Ps), np.concatenate(Fs)
         q = triangle_quality(Pw, Fw)
         t = topology_report(Pw, Fw, welded=True)
         out.update({k: round(float(q[k]), 4) for k in
@@ -478,15 +496,18 @@ def mesh_stats(source_glb_path: str) -> Dict:
             prims += 1
             n = g.accessors[prim.attributes.POSITION].count
             verts += n
-            tris += (g.accessors[prim.indices].count // 3) if prim.indices is not None else n // 3
+            if (prim.mode if prim.mode is not None else 4) == 4:   # lines/points/strips: no tris
+                tris += (g.accessors[prim.indices].count // 3) if prim.indices is not None else n // 3
     has_skin = bool(g.skins)
     has_animation = bool(g.animations)
-    optimizable = prims > 0 and not has_skin and not has_animation
+    optimizable = tris > 0 and not has_skin and not has_animation
     recommended_ratio = min(1.0, TARGET_TRIANGLES / tris) if tris else 1.0
     return {
         "triangles": int(tris),
         "vertices": int(verts),
         "primitives": int(prims),
+        "meshes": len(g.meshes or []),
+        "materials": len(g.materials or []),
         "file_size": os.path.getsize(source_glb_path),
         "has_skin": has_skin,
         "has_animation": has_animation,
@@ -792,9 +813,11 @@ def _drop_zero_volume_flaps(pos: np.ndarray, faces: np.ndarray) -> np.ndarray:
     and that pair is kept instead.
     """
     n_v = len(pos)
-    tri = np.sort(faces, axis=1)
-    fkey = (tri[:, 0].astype(np.int64) * n_v + tri[:, 1]) * n_v + tri[:, 2]
-    _, inv_f, cnt_f = np.unique(fkey, return_inverse=True, return_counts=True)
+    tri = np.sort(faces, axis=1).astype(np.int64)
+    # Row-wise unique, not a packed `(a*n + b)*n + c` key: that overflows int64 once the mesh has
+    # more than ~2.1M vertices and then reports unrelated faces as coincident.
+    _, inv_f, cnt_f = np.unique(tri, axis=0, return_inverse=True, return_counts=True)
+    inv_f = inv_f.reshape(-1)
     if not (cnt_f[inv_f] > 1).any():
         return np.ones(len(faces), dtype=bool)
 
@@ -819,6 +842,67 @@ def _drop_zero_volume_flaps(pos: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return keep
 
 
+def _seam_fins(Pw32: np.ndarray, Fw: np.ndarray, Fraw: np.ndarray, attrs: Dict[str, np.ndarray],
+               labels: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """Constraint fins that make the simplifier respect ATTRIBUTE SEAMS. Returns (apex points,
+    fin faces over welded ids + apex ids numbered from len(Pw32)).
+
+    A UV seam, a hard edge or a material border is invisible to a position-only quadric wherever
+    the surface is flat, so the collapse runs straight across it and the faces on one side end up
+    painted with the other side's texels. On a character the seams sit on curved surfaces and this
+    stayed rare; on a kit piece — a flat wall whose decal sits in its own atlas chart — it smeared
+    the decal across the wall (measured 638 texels of UV drift at p95 on a real entrance at 25%).
+
+    The textbook remedy is a constraint plane through each seam edge, perpendicular to the surface.
+    fast_simplification has no hook for one, so it is given as GEOMETRY: one extra triangle per
+    seam edge, standing on the edge along the surface normal. Its plane is exactly that constraint,
+    and because its two new edges belong to a single triangle the seam's vertices become BORDER
+    vertices, which the simplifier only collapses into other border vertices — i.e. along the seam,
+    never across it. The fins are dropped after the replay; no output face comes from them.
+    """
+    keys = []
+    for name in ("TEXCOORD_0", "NORMAL"):
+        a = attrs.get(name)
+        if a is not None:
+            keys.append(np.round(np.asarray(a, dtype=np.float64).reshape(len(a), -1), 4))
+    if labels is not None:
+        keys.append(np.asarray(labels, dtype=np.float64)[:, None])
+    if not keys:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64)
+    _, akey = np.unique(np.concatenate(keys, axis=1), axis=0, return_inverse=True)
+    akey = akey.reshape(-1)
+    # half-edges of the welded mesh with the raw vertex at each end
+    wa = np.concatenate([Fw[:, 0], Fw[:, 1], Fw[:, 2]])
+    wb = np.concatenate([Fw[:, 1], Fw[:, 2], Fw[:, 0]])
+    ra = np.concatenate([Fraw[:, 0], Fraw[:, 1], Fraw[:, 2]])
+    rb = np.concatenate([Fraw[:, 1], Fraw[:, 2], Fraw[:, 0]])
+    fid = np.tile(np.arange(len(Fw)), 3)
+    swap = wa > wb
+    lo, hi = np.where(swap, wb, wa), np.where(swap, wa, wb)
+    klo, khi = akey[np.where(swap, rb, ra)], akey[np.where(swap, ra, rb)]
+    code = lo.astype(np.int64) * (int(Fw.max()) + 1) + hi
+    order = np.argsort(code, kind="stable")
+    code, klo, khi, fid, lo, hi = code[order], klo[order], khi[order], fid[order], lo[order], hi[order]
+    starts = np.flatnonzero(np.r_[True, code[1:] != code[:-1]])
+    cnt = np.diff(np.r_[starts, len(code)])
+    seam = ((np.minimum.reduceat(klo, starts) != np.maximum.reduceat(klo, starts)) |
+            (np.minimum.reduceat(khi, starts) != np.maximum.reduceat(khi, starts))) & (cnt >= 2)
+    if not seam.any():
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64)
+    P = Pw32.astype(np.float64)
+    fn = np.cross(P[Fw[:, 1]] - P[Fw[:, 0]], P[Fw[:, 2]] - P[Fw[:, 0]])
+    fn /= np.linalg.norm(fn, axis=1, keepdims=True) + 1e-30
+    nsum = np.add.reduceat(fn[fid], starts, axis=0)[seam]
+    a, b = lo[starts][seam], hi[starts][seam]
+    ln = np.linalg.norm(nsum, axis=1)
+    elen = np.linalg.norm(P[b] - P[a], axis=1)
+    ok = (ln > 1e-6) & (elen > 0)
+    a, b, n, elen = a[ok], b[ok], nsum[ok] / ln[ok, None], elen[ok]
+    apex = (0.5 * (P[a] + P[b]) + n * elen[:, None]).astype(np.float32)
+    ids = len(Pw32) + np.arange(len(a))
+    return apex, np.stack([a, b, ids], axis=1).astype(np.int64)
+
+
 def _decimate_primitive(
     P: np.ndarray,
     F: np.ndarray,
@@ -827,11 +911,19 @@ def _decimate_primitive(
     stats: Optional[Dict] = None,
     head_boost: Optional[float] = None,
     hand_boost: Optional[float] = None,
-) -> Optional[Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]]:
+    return_source: bool = False,
+    seam_lock: bool = False,
+    labels: Optional[np.ndarray] = None,
+) -> Optional[Tuple[np.ndarray, ...]]:
     """Seam-preserving decimation of one primitive. Returns (positions, faces, attrs) or None
     if the primitive is too small / the reduction is a no-op.
 
     `stats`, when given, receives density telemetry (`head_vertex_share_before/after`).
+    `return_source=True` appends a 4th array: the raw source vertex each output vertex copied its
+    attributes from. `_decimate_glb` uses it to split a jointly decimated multi-primitive mesh back
+    into its primitives (a raw vertex belongs to exactly one of them).
+    `seam_lock` keeps collapses from crossing attribute seams (see `_seam_fins`); `labels` (one per
+    raw vertex, e.g. the primitive it came from) adds borders the attributes alone do not show.
     """
     import fast_simplification as _fs
 
@@ -865,18 +957,40 @@ def _decimate_primitive(
     # target_count is exact where target_reduction rounds; the simplifier may still stop short of
     # it when the schedule runs out of collapsible edges, which the caller reports as-is.
     target_count = int(max(16, round(len(Fw32) * float(np.clip(target_ratio, 0.02, 0.95)))))
-    out = _fs.simplify(
-        Pw32, Fw32,
-        target_count=target_count,
-        agg=_SIMPLIFY_AGG,
-        return_collapses=True,
-    )
-    _, _, collapses = out
-    if collapses is None or len(collapses) == 0:
-        return None
-    pts_r, _, vmap = _fs.replay_simplification(Pw32, Fw32, collapses)
-    vmap = np.asarray(vmap, dtype=np.int64)
+    apex, fins = (_seam_fins(Pw32, Fw_clean, F_clean, attrs, labels) if seam_lock
+                  else (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64)))
+    P_in = np.concatenate([Pw32, apex]) if len(fins) else Pw32
+    F_in = np.concatenate([Fw32, fins.astype(np.int32)]) if len(fins) else Fw32
+    # The simplifier counts the fins' faces toward its target, but most fins collapse away with
+    # their seam edges, so a target of "real + fins" lands that many real faces OVER. Measure the
+    # real faces the replay actually kept and run once more with the target corrected.
+    goal = target_count + len(fins)
+    for _attempt in range(3 if len(fins) else 1):
+        out = _fs.simplify(P_in, F_in, target_count=int(max(goal, 16)), agg=_SIMPLIFY_AGG,
+                           return_collapses=True)
+        _, _, collapses = out
+        if collapses is None or len(collapses) == 0:
+            return None
+        pts_r, _, vmap = _fs.replay_simplification(P_in, F_in, collapses)
+        vmap = np.asarray(vmap, dtype=np.int64)
+        if not len(fins):
+            break
+        Fr = vmap[Fw_clean]
+        real = int(((Fr[:, 0] != Fr[:, 1]) & (Fr[:, 1] != Fr[:, 2]) & (Fr[:, 0] != Fr[:, 2])).sum())
+        if real <= target_count * 1.05 or goal <= 16:
+            break
+        goal -= real - target_count
     pts_r = np.asarray(pts_r, dtype=np.float64)
+    if len(fins):
+        # Drop the fins' apex points: keep only output vertices some REAL vertex maps to.
+        has_real = np.bincount(vmap[:n_weld], minlength=len(pts_r)) > 0
+        remap = np.cumsum(has_real) - 1
+        vmap = remap[vmap[:n_weld]]
+        pts_r = pts_r[has_real]
+        collapses = np.asarray(collapses)
+        collapses = collapses[collapses[:, 1] < n_weld]
+        if stats is not None:
+            stats["seam_fins"] = int(len(fins))
 
     # THE MERGED POSITION IS NOT NEGOTIABLE. `pts_r` is the quadric-optimal position of each
     # collapse cluster, and it is the position the simplifier's own normal-flip test
@@ -896,7 +1010,8 @@ def _decimate_primitive(
     surv_ids = np.where(~is_collapsed)[0]
     surv = np.full(len(pts_r), -1, dtype=np.int64)
     surv[vmap[surv_ids]] = surv_ids
-    if (surv < 0).any():   # replay/collapse bookkeeping mismatch — bail rather than corrupt
+    # (with seam fins, a cluster whose survivor was an apex point has no real survivor — expected)
+    if (surv < 0).any() and not len(fins):   # replay bookkeeping mismatch — bail, never corrupt
         logger.warning("retopotool: unmapped output vertices; skipping primitive")
         return None
     if stats is not None and head_mask.any():
@@ -913,6 +1028,11 @@ def _decimate_primitive(
     _o = np.lexsort((d_opt, vmap))                      # group by cluster, nearest first inside it
     _cand_start = np.searchsorted(vmap[_o], np.arange(len(pts_r) + 1))
     anchor = _o[_cand_start[:-1]]
+    # A cluster of ONE absorbed nobody, so its vertex never moved — emit the source position itself.
+    # Read back through the float32 simplify space it is off by a rounding step, which is enough to
+    # break bit-exact seams with geometry that was not decimated (another mesh, a skipped part).
+    single = np.diff(_cand_start) == 1
+    opt_real[single] = Pw[anchor[single]]
     if stats is not None:
         stats["anchor_is_survivor_frac"] = float(np.mean(anchor == surv))
 
@@ -938,7 +1058,12 @@ def _decimate_primitive(
     # ---- triangle-quality pass (flips only; no vertex moves) ------------------------------------
     # Runs BEFORE the solidity pass so solidity stays the last word on face validity, and after the
     # face remap so it operates on the faces that will actually be written.
-    isl = _uv_islands(n_raw, F) if attrs.get("TEXCOORD_0") is not None else None
+    # ISLANDS ARE COMPUTED WITH OR WITHOUT UVs. An island is a connected component of the RAW face
+    # graph, which splits not only at UV seams but at every hard (split-normal) edge and between the
+    # primitives of a jointly decimated mesh. Both the flip pass and the wedge re-split below must
+    # stay inside one: a flip across a hard edge rounds off a crate's corner, and a wedge that picks
+    # a raw vertex from the far side takes that side's NORMAL (or another primitive's attributes).
+    isl = _uv_islands(n_raw, F)
     n_flips = 0
     if _QUALITY_PASS and len(Fo) >= 64:
         crease_cos = float(np.cos(np.radians(_FLIP_CREASE_DEG)))
@@ -996,30 +1121,29 @@ def _decimate_primitive(
     cc = cand[anchor[w_corners]]                     # (C, kmax) candidate raw verts
 
     uv = attrs.get("TEXCOORD_0")
-    if uv is None:
-        chosen = cc[:, 0]
-    else:
-        # per-corner: candidate on the ANCESTOR'S UV ISLAND whose UV is nearest the ancestor's
-        # (chunked to bound memory). Cross-island candidates are excluded outright — their UVs
-        # point at unrelated atlas regions, and picking one smears that region across the face.
-        # When the anchor vertex has no split on the ancestor's island (the collapse crossed
-        # a seam), keep the ancestor's own attributes at the new position: the corner then
-        # samples its original texels instead of another island's.
-        if isl is None:                      # only when TEXCOORD_0 appeared after the hoist above
-            isl = _uv_islands(n_raw, F)
-        uvf = uv.astype(np.float32)
-        anc_isl = isl[anc_corners]
-        chosen = np.empty(len(cc), dtype=np.int64)
-        CHUNK = 500_000
-        for s in range(0, len(cc), CHUNK):
-            e = min(s + CHUNK, len(cc))
-            block = cc[s:e]
+    # per-corner: candidate on the ANCESTOR'S ISLAND whose UV is nearest the ancestor's (chunked to
+    # bound memory). Cross-island candidates are excluded outright — their UVs point at unrelated
+    # atlas regions (or their normals at the other side of a hard edge), and picking one smears that
+    # across the face. When the anchor vertex has no split on the ancestor's island (the collapse
+    # crossed a seam), keep the ancestor's own attributes at the new position: the corner then
+    # samples its original texels instead of another island's. Without UVs the same island rule
+    # applies with no distance to rank by.
+    uvf = uv.astype(np.float32) if uv is not None else None
+    anc_isl = isl[anc_corners]
+    chosen = np.empty(len(cc), dtype=np.int64)
+    CHUNK = 500_000
+    for s in range(0, len(cc), CHUNK):
+        e = min(s + CHUNK, len(cc))
+        block = cc[s:e]
+        if uvf is not None:
             d = uvf[block] - uvf[anc_corners[s:e]][:, None, :]
             dist = (d * d).sum(-1)
-            same = isl[block] == anc_isl[s:e][:, None]
-            dist[~same] = np.inf
-            pick = block[np.arange(e - s), np.argmin(dist, axis=1)]
-            chosen[s:e] = np.where(same.any(axis=1), pick, anc_corners[s:e])
+        else:
+            dist = np.zeros(block.shape, dtype=np.float32)
+        same = isl[block] == anc_isl[s:e][:, None]
+        dist[~same] = np.inf
+        pick = block[np.arange(e - s), np.argmin(dist, axis=1)]
+        chosen[s:e] = np.where(same.any(axis=1), pick, anc_corners[s:e])
 
     # dedupe (output welded vert, chosen raw ancestor) -> final split vertices
     key = w_corners * np.int64(n_raw) + chosen
@@ -1060,7 +1184,9 @@ def _decimate_primitive(
     # the vertex is no longer standing there. Re-read it from the source surface at the emitted
     # position, inside the chart the copy just picked. See `_resample_uv_on_source` / _UV_RESAMPLE.
     if _UV_RESAMPLE and uv is not None:
-        uv_sets = {n: attrs[n] for n in ("TEXCOORD_0", "TEXCOORD_1") if attrs.get(n) is not None}
+        uv_sets = {n: a for n, a in attrs.items()
+                   if n.startswith("TEXCOORD_") and a is not None and a.ndim == 2
+                   and np.issubdtype(a.dtype, np.floating)}
         try:
             attrs_out.update(_resample_uv_on_source(
                 P.astype(np.float64), F, uv_sets, vr, opt_real[vw], stats=stats))
@@ -1101,6 +1227,8 @@ def _decimate_primitive(
         if stats is not None:
             stats["skin_keyed_on_position"] = True
             stats["skin_blended"] = blended is not None
+    if return_source:
+        return pos_out, Fo_new, attrs_out, vr
     return pos_out, Fo_new, attrs_out
 
 
@@ -1312,117 +1440,390 @@ def _texture_image_index(g: GLTF2, tex_index: Optional[int]) -> Optional[int]:
     return int(src) if src is not None else None
 
 
-def _reference_highpoly(path: str) -> Optional[Dict[str, np.ndarray]]:
-    """Load an external mesh to bake FROM. Used by the LOD ladder, where the high-poly is the full
-    rig rather than the file being decimated. Only the first triangle primitive is taken — every
-    character in this pipeline is a single primitive, and silently concatenating several would
-    scramble the UV correspondence the bake depends on."""
+def _reference_highpoly(path: str) -> Dict[Tuple[int, int], Dict[str, np.ndarray]]:
+    """Load an external mesh to bake FROM, keyed by (mesh index, primitive index). Used by the LOD
+    ladder, where the high-poly is the full-resolution source rather than the file being decimated.
+    Each decimated primitive bakes against the reference primitive at the SAME key — taking one
+    primitive for all of them (what this did while every input was a one-primitive character)
+    bakes a multi-material prop's every part against its first part."""
     g = GLTF2().load(path)
     blob = g.binary_blob()
     if blob is None:
         # The file parsed as a JSON glTF, not a GLB — see the extension note at the save site.
         raise ValueError(f"{path} has no binary chunk; it was not written as a GLB")
-    for mesh in (g.meshes or []):
-        for prim in mesh.primitives:
+    from . import bake_normals as _b
+    out: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
+    for mi, mesh in enumerate(g.meshes or []):
+        for pi, prim in enumerate(mesh.primitives):
             at = prim.attributes
-            if at.POSITION is None or at.TEXCOORD_0 is None or prim.indices is None:
+            if at.POSITION is None or at.TEXCOORD_0 is None or (prim.mode or 4) != 4:
                 continue
-            out = {
-                "P": _acc(g, blob, at.POSITION).astype(np.float64),
-                "F": _acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3),
-                "UV": _acc(g, blob, at.TEXCOORD_0).astype(np.float64),
-                "NORMAL": (_acc(g, blob, at.NORMAL).astype(np.float64)
-                           if at.NORMAL is not None else None),
-                "TANGENT": (_acc(g, blob, at.TANGENT).astype(np.float64)
-                            if at.TANGENT is not None else None),
-            }
+            P = _read_position(g, blob, at.POSITION)
+            F = (_acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
+                 if prim.indices is not None else np.arange(len(P), dtype=np.int64).reshape(-1, 3))
             mat = (g.materials[prim.material]
                    if prim.material is not None and g.materials else None)
-            out["normal_map"] = None
+            nmap = None
             if mat is not None and mat.normalTexture is not None:
-                ii = _texture_image_index(g, mat.normalTexture.index)
-                if ii is not None and g.images and ii < len(g.images):
-                    img = g.images[ii]
-                    if img.bufferView is not None:
-                        from . import bake_normals as _b
-                        bv = g.bufferViews[img.bufferView]
-                        off = bv.byteOffset or 0
-                        out["normal_map"] = _b.decode_image(bytes(blob[off:off + bv.byteLength]))
-            return out
+                raw = _image_bytes(g, blob, _texture_image_index(g, mat.normalTexture.index))
+                nmap = _b.decode_image(raw) if raw is not None else None
+            out[(mi, pi)] = {
+                "P": P.astype(np.float64), "F": F,
+                "UV": _read_float_attr(g, blob, "TEXCOORD_0", at.TEXCOORD_0).astype(np.float64),
+                "NORMAL": (_read_float_attr(g, blob, "NORMAL", at.NORMAL).astype(np.float64)
+                           if at.NORMAL is not None else None),
+                "TANGENT": (_read_float_attr(g, blob, "TANGENT", at.TANGENT).astype(np.float64)
+                            if at.TANGENT is not None else None),
+                "normal_map": nmap,
+            }
+    return out
+
+
+def _image_bytes(g: GLTF2, blob: bytes, img_idx: Optional[int]) -> Optional[bytes]:
+    """Embedded bytes of an image (None for external / data-URI images or a bad index)."""
+    if img_idx is None or not g.images or img_idx >= len(g.images):
+        return None
+    img = g.images[img_idx]
+    if img.bufferView is None:
+        return None
+    bv = g.bufferViews[img.bufferView]
+    off = bv.byteOffset or 0
+    return bytes(blob[off:off + bv.byteLength])
+
+
+def _image_size(raw: Optional[bytes]) -> Optional[int]:
+    """Largest dimension of an encoded image, from its header only."""
+    if not raw:
+        return None
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        with _PIL.open(_io.BytesIO(raw)) as im:
+            return int(max(im.size))
+    except Exception:
+        return None
+
+
+def _uv_overlap_frac(uvs: List[np.ndarray], faces: List[np.ndarray], res: int = 512) -> float:
+    """How much of the UV layout is claimed twice: 1 - (texels covered) / (texels the triangles'
+    UV area adds up to). Sampling texel centres is unbiased for area, so an atlas whose charts do
+    not overlap lands near 0 at any density; a mirrored or stacked layout lands near the fraction
+    of area it reuses."""
+    from .bake_normals import _rasterize_uv
+    covered = np.zeros((res, res), dtype=bool)
+    area = 0.0
+    for uv, F in zip(uvs, faces):
+        uv = np.asarray(uv, dtype=np.float64)
+        d1 = uv[F[:, 1]] - uv[F[:, 0]]
+        d2 = uv[F[:, 2]] - uv[F[:, 0]]
+        area += float(np.abs(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]).sum() * 0.5)
+        tri_id, _ = _rasterize_uv(uv, F, res)
+        covered |= tri_id >= 0
+    expect = area * res * res
+    if expect < 64:                         # too little UV area to judge; do not block the bake
+        return 0.0
+    return float(max(0.0, 1.0 - covered.sum() / expect))
+
+
+# The bake is refused for a material whose UV layout reuses more than this share of its area
+# (mirrored halves, stacked islands): a per-texel normal map cannot hold two different surfaces.
+BAKE_MAX_UV_OVERLAP = 0.10
+# A baked map is KEPT only if it brings the shading closer to the source than the decimated mesh
+# with its carried normals and original map already is (`_bake_helps`). Measured on real kit props
+# at 25% (mean angular error vs the source, baked / unbaked): a barrel 6.7 / 16.0 deg, a tank
+# 3.7 / 12.0, a cement entrance 6.0 / 8.4 — the bake repairs what the decimation broke — but a
+# door 15.0 / 14.8, whose relief already lived in its normal map: re-encoding that map costs more
+# than the decimation did, so it keeps its original map and normals.
+# The statistic is a TRIMMED mean: samples where either variant is off by more than
+# BAKE_CHECK_TRIM_DEG are dropped. On double-sided kit geometry (walls with back-to-back faces)
+# the nearest-surface lookup lands on the wrong side for up to 20% of samples, at ~140 deg for
+# both variants, and a plain mean drowns the real difference in that noise. A median is wrong the
+# other way: it ignores exactly the patches the bake exists to repair.
+# Set RETOPO_BAKE_CHECK=0 to keep every bake unconditionally.
+_BAKE_CHECK = os.environ.get("RETOPO_BAKE_CHECK", "1") not in ("0", "false", "False")
+BAKE_CHECK_SAMPLES = 20_000
+BAKE_CHECK_MARGIN = 0.97        # the bake must cut the mean error by at least 3%
+BAKE_CHECK_TRIM_DEG = 60.0
+# ...and for UVs outside the unit square by more than this (tiling materials, trim sheets): the
+# rasterizer cannot address texels outside [0,1], and a tiling texture is shared by every surface
+# that repeats it.
+BAKE_UV_RANGE_TOL = 0.01
+
+
+def _bake_ineligible(g: GLTF2, mat, plans: List[Dict]) -> Optional[str]:
+    """Why a material's primitives cannot share one baked normal map, or None if they can."""
+    if mat is None:
+        return "no material to attach a normal map to"
+    for plan in plans:
+        if plan["attrs"].get("TEXCOORD_0") is None or plan["attrs_in"].get("TEXCOORD_0") is None:
+            return "no TEXCOORD_0"
+    nt = mat.normalTexture
+    if nt is not None:
+        if (nt.texCoord or 0) != 0:
+            return f"normal map samples TEXCOORD_{nt.texCoord}"
+        if "KHR_texture_transform" in (nt.extensions or {}):
+            return "normal map uses KHR_texture_transform"
+    lo, hi = -BAKE_UV_RANGE_TOL, 1.0 + BAKE_UV_RANGE_TOL
+    for plan in plans:
+        for uv in (plan["attrs_in"]["TEXCOORD_0"], plan["attrs"]["TEXCOORD_0"]):
+            if len(uv) and (float(uv.min()) < lo or float(uv.max()) > hi):
+                return "UVs outside 0-1 (tiling texture / trim sheet)"
+    ov = _uv_overlap_frac([p["attrs_in"]["TEXCOORD_0"] for p in plans], [p["F"] for p in plans])
+    if ov > BAKE_MAX_UV_OVERLAP:
+        return f"overlapping UVs ({ov:.0%} of the layout is reused)"
     return None
+
+
+def _bake_helps(checks: List[Dict], final_map: np.ndarray, src_map: Optional[np.ndarray],
+                scale: float) -> Dict:
+    """Mean shading error vs the source, baked vs not, over a sample of source vertices.
+
+    `checks`: per primitive {"hi": high-poly dict, "hi_map", "plan", "n_lo", "t_lo"}. The unbaked
+    variant is exactly what would be written without the bake: the carried NORMAL / TANGENT and the
+    material's original map."""
+    from .bake_normals import shade_at
+    rng = np.random.default_rng(0)
+    per = max(BAKE_CHECK_SAMPLES // max(len(checks), 1), 256)
+    err_b, err_p = [], []
+    fmap = final_map.astype(np.float32) / 255.0
+    for c in checks:
+        hi, plan = c["hi"], c["plan"]
+        P_hi = np.asarray(hi["P"], dtype=np.float64)
+        F_hi = np.asarray(hi["F"], dtype=np.int64)
+        idx = np.unique(F_hi.reshape(-1))
+        if len(idx) > per:
+            idx = rng.choice(idx, per, replace=False)
+        Q = P_hi[idx]
+        N_hi = hi.get("NORMAL")
+        if N_hi is None:
+            from .bake_normals import _smooth_normals
+            N_hi = _smooth_normals(P_hi, F_hi)
+        ref = shade_at(Q, P_hi, F_hi, hi["UV"], N_hi, hi.get("TANGENT"), c["hi_map"], scale)
+        pos = plan["pos"].astype(np.float64)
+        uv = plan["attrs"]["TEXCOORD_0"].astype(np.float64)
+        nb = shade_at(Q, pos, plan["faces"], uv, c["n_lo"], c["t_lo"], fmap, 1.0)
+        n_carried = plan["attrs"].get("NORMAL")
+        if n_carried is None:
+            from .bake_normals import _smooth_normals
+            n_carried = _smooth_normals(pos, plan["faces"])
+        npl = shade_at(Q, pos, plan["faces"], uv, n_carried, plan["attrs"].get("TANGENT"),
+                       src_map, scale)
+        err_b.append(np.degrees(np.arccos(np.clip((nb * ref).sum(1), -1, 1))))
+        err_p.append(np.degrees(np.arccos(np.clip((npl * ref).sum(1), -1, 1))))
+    eb, ep = np.concatenate(err_b), np.concatenate(err_p)
+    ok = (eb < BAKE_CHECK_TRIM_DEG) & (ep < BAKE_CHECK_TRIM_DEG)
+    if ok.mean() >= 0.5:
+        eb, ep = eb[ok], ep[ok]
+    mb, mp = float(eb.mean()), float(ep.mean())
+    return {"baked_mean_deg": round(mb, 3), "unbaked_mean_deg": round(mp, 3),
+            "samples": int(len(eb)), "kept": mb < mp * BAKE_CHECK_MARGIN}
 
 
 def _bake_stage(g: GLTF2, blob: bytes, plans: List[Dict],
                 reference_glb: Optional[str] = None, res_hint: Optional[int] = None
-                ) -> Tuple[Dict, Dict[int, bytes], List[Tuple[int, bytes]]]:
-    """Bake the high-poly detail of every decimated primitive into its material's normal map.
+                ) -> Tuple[Dict, List[Dict]]:
+    """Bake the high-poly detail of every decimated primitive into a normal map, ONE MAP PER
+    MATERIAL: primitives that share a material share its UV atlas, so their bakes are composited
+    texel-by-texel into a single map. (Baking them one by one into the same slot, which this did,
+    leaves the material holding whichever primitive was baked last.)
 
-    Mutates each plan's NORMAL/TANGENT attributes in place — the bake is only valid in the tangent
-    frame it was computed against, so the map and the basis must ship together.
-    Returns (stats, {image index: new PNG bytes}, [(material index, PNG bytes) needing a new map]).
+    Mutates each baked plan's NORMAL/TANGENT attributes in place — the bake is only valid in the
+    tangent frame it was computed against, so the map and the basis must ship together. A material
+    that cannot be baked safely (tiling or overlapping UVs, a transformed normal map, no UVs) is
+    skipped and its primitives keep the attributes the decimator carried over from the source.
+
+    Returns (stats, [{"material", "data", "mime", "prims"}]) — `_assign_baked_maps` wires them in.
     """
     from . import bake_normals as bake
 
-    overrides: Dict[int, bytes] = {}
-    additions: List[Tuple[int, bytes]] = []
-    baked = 0
-    details: List[Dict] = []
-    ref = _reference_highpoly(reference_glb) if reference_glb else None
+    ref = _reference_highpoly(reference_glb) if reference_glb else {}
+    groups: Dict[Optional[int], List[Dict]] = {}
     for plan in plans:
-        prim = plan["prim"]
-        uv_lo = plan["attrs"].get("TEXCOORD_0")
-        uv_hi = plan["attrs_in"].get("TEXCOORD_0")
-        if uv_lo is None or uv_hi is None:
-            details.append({"skipped": "no TEXCOORD_0"})
-            continue
-        mat_idx = prim.material
-        mat = g.materials[mat_idx] if (mat_idx is not None and g.materials
-                                       and mat_idx < len(g.materials)) else None
-        src_img_idx = _texture_image_index(g, mat.normalTexture.index) if (
-            mat is not None and mat.normalTexture is not None) else None
-        src_map = None
-        if src_img_idx is not None and g.images and src_img_idx < len(g.images):
-            img = g.images[src_img_idx]
-            if img.bufferView is not None:
-                bv = g.bufferViews[img.bufferView]
-                off = bv.byteOffset or 0
-                src_map = bake.decode_image(bytes(blob[off:off + bv.byteLength]))
+        groups.setdefault(plan["prim"].material, []).append(plan)
 
-        # High-poly to bake FROM: an external reference (the full-resolution rig, for an LOD) or
-        # this file's own pre-decimation geometry. Chaining through a reference is lossless in the
-        # way that matters — the reference's own baked map already carries the original micro-detail
-        # and the compose step below samples it.
-        hi = ref or {"P": plan["P"].astype(np.float64), "F": plan["F"],
-                     "UV": uv_hi.astype(np.float64),
-                     "NORMAL": plan["attrs_in"].get("NORMAL"),
-                     "TANGENT": plan["attrs_in"].get("TANGENT"),
-                     "normal_map": src_map}
-        hi_map = hi.get("normal_map") if ref else src_map
-        res = bake.pick_resolution(
-            [res_hint] if res_hint else ([hi_map.shape[0]] if hi_map is not None else []),
-            allow_small=res_hint is not None)
-        rgb, n_lo, t_lo, st = bake.bake_normal_map(
-            hi["P"], hi["F"], hi["UV"], hi.get("NORMAL"), hi.get("TANGENT"), hi_map,
-            plan["pos"].astype(np.float64), plan["faces"], uv_lo.astype(np.float64),
-            res,
-        )
-        png = bake.encode_png(rgb)
-        # The baked map replaces the source normal map only when this primitive is the sole user of
-        # that image; otherwise another material would silently inherit this mesh's tangent frame.
-        if src_img_idx is not None and src_img_idx not in overrides:
-            overrides[src_img_idx] = png
-        elif mat_idx is not None:
-            additions.append((mat_idx, png))
+    baked_maps: List[Dict] = []
+    details: List[Dict] = []
+    updates: List[Tuple[Dict, np.ndarray, np.ndarray]] = []
+    baked = 0
+    for mat_idx, gp in groups.items():
+        mat = (g.materials[mat_idx] if (mat_idx is not None and g.materials
+                                        and mat_idx < len(g.materials)) else None)
+        why = _bake_ineligible(g, mat, gp)
+        if why:
+            logger.info("retopotool: not baking material %s: %s", mat_idx, why)
+            details.append({"material": mat_idx, "skipped": why})
+            continue
+        src_img_idx = (_texture_image_index(g, mat.normalTexture.index)
+                       if mat.normalTexture is not None else None)
+        src_raw = _image_bytes(g, blob, src_img_idx)
+        src_map = bake.decode_image(src_raw) if src_raw is not None else None
+        scale = float(mat.normalTexture.scale if (mat.normalTexture is not None
+                                                  and mat.normalTexture.scale is not None) else 1.0)
+        if res_hint:
+            res = bake.pick_resolution([res_hint], allow_small=True)
+        else:
+            # The map ships at the size the material's own textures already are: the source normal
+            # map, else the base colour (else BAKE_MIN_RES). A prop with a 512 texture does not
+            # want a 2048 bake.
+            size = _image_size(src_raw)
+            if size is None and mat.pbrMetallicRoughness is not None \
+                    and mat.pbrMetallicRoughness.baseColorTexture is not None:
+                size = _image_size(_image_bytes(
+                    g, blob, _texture_image_index(g, mat.pbrMetallicRoughness.baseColorTexture.index)))
+            res = bake.pick_resolution([size or bake.BAKE_MIN_RES], allow_small=True)
+
+        rgb_acc = np.zeros((res, res, 3), dtype=np.float32)
+        cov_acc = np.zeros((res, res), dtype=bool)
+        results = []
+        checks = []
+        gdet: List[Dict] = []
+        for plan in gp:
+            r = ref.get(plan["key"])
+            if r is not None:
+                hi, hi_map, hi_scale = r, r.get("normal_map"), scale
+            else:
+                hi = {"P": plan["P"].astype(np.float64), "F": plan["F"],
+                      "UV": plan["attrs_in"]["TEXCOORD_0"].astype(np.float64),
+                      "NORMAL": plan["attrs_in"].get("NORMAL"),
+                      "TANGENT": plan["attrs_in"].get("TANGENT")}
+                hi_map, hi_scale = src_map, scale
+            rgb, cov, n_lo, t_lo, st = bake.bake_texels(
+                hi["P"], hi["F"], hi["UV"], hi.get("NORMAL"), hi.get("TANGENT"), hi_map,
+                plan["pos"].astype(np.float64), plan["faces"],
+                plan["attrs"]["TEXCOORD_0"].astype(np.float64), res,
+                N_lo_guide=plan["attrs"].get("NORMAL"), src_normal_scale=hi_scale)
+            rgb_acc[cov] = rgb[cov]
+            cov_acc |= cov
+            results.append((plan, n_lo, t_lo))
+            checks.append({"hi": hi, "hi_map": hi_map, "plan": plan, "n_lo": n_lo, "t_lo": t_lo})
+            st["material"] = mat_idx
+            gdet.append(st)
+        final = bake.finish_map(rgb_acc, cov_acc)
+        if _BAKE_CHECK:
+            verdict = _bake_helps(checks, final, src_map, scale)
+            if not verdict["kept"]:
+                logger.info("retopotool: material %s keeps its original normals and map: %s",
+                            mat_idx, verdict)
+                details.append({"material": mat_idx, "check": verdict,
+                                "skipped": "the bake did not improve shading "
+                                           f"({verdict['baked_mean_deg']} vs "
+                                           f"{verdict['unbaked_mean_deg']} deg mean error)"})
+                continue
+            for st in gdet:
+                st["check"] = verdict
+        details += gdet
+        raw, mime = bake.encode_map(final, src_raw)
+        updates += results
+        baked_maps.append({"material": mat_idx, "data": raw, "mime": mime,
+                           "prims": [p["prim"] for p in gp]})
+    # Only now, with every material baked, touch the plans: an exception above must leave every
+    # primitive with the attributes the decimator carried, not half of them re-based.
+    for plan, n_lo, t_lo in updates:
         plan["attrs"]["NORMAL"] = n_lo
         plan["attrs"]["TANGENT"] = t_lo
         baked += 1
-        details.append(st)
     stats = {
         "normal_map_baked": baked > 0,
         "bake_resolution": max([d.get("resolution", 0) for d in details], default=0) or None,
-        "bake": details,
+        "bake_skipped": [d for d in details if "skipped" in d],
+        "bake": [d for d in details if "skipped" not in d],
     }
-    return stats, overrides, additions
+    return stats, baked_maps
+
+
+def _texture_refs(g: GLTF2) -> Dict[int, int]:
+    """How many texture-info slots across all materials (core AND extension slots, e.g.
+    KHR_materials_clearcoat's normal texture) point at each texture index."""
+    counts: Dict[int, int] = {}
+
+    def walk(o, under_texture=False):
+        if o is None:
+            return
+        if isinstance(o, dict):
+            if under_texture and isinstance(o.get("index"), int):
+                counts[o["index"]] = counts.get(o["index"], 0) + 1
+            for k, v in o.items():
+                walk(v, isinstance(k, str) and k.lower().endswith("texture"))
+            return
+        if isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v, under_texture)
+            return
+        if hasattr(o, "__dict__"):
+            name = type(o).__name__
+            if (name.endswith("TextureInfo") or name.endswith("MaterialTexture")) \
+                    and isinstance(getattr(o, "index", None), int):
+                counts[o.index] = counts.get(o.index, 0) + 1
+            for k, v in vars(o).items():
+                if k == "index":
+                    continue
+                walk(v, isinstance(k, str) and k.lower().endswith("texture"))
+
+    for mat in (g.materials or []):
+        walk(mat)
+    return counts
+
+
+def _assign_baked_maps(g: GLTF2, baked_maps: List[Dict]
+                       ) -> Tuple[Dict[int, Tuple[bytes, str]], List[Tuple[int, bytes, str]]]:
+    """Decide where each baked map goes WITHOUT changing anything outside the baked primitives.
+
+    The map replaces the source normal image in place only when nothing else can see that image:
+    one texture uses it, one material slot uses that texture (the baked material's normal slot) and
+    every primitive using the material was baked into this map. Otherwise the material — cloned
+    first if primitives outside this bake also use it — gets a freshly minted image. A tiling
+    normal map shared by forty wall pieces stays exactly what it was for the other thirty-nine.
+
+    Returns ({image index: (bytes, mime)} to overwrite, [(material index, bytes, mime)] needing a
+    new image).
+    Mutates `g.materials` (clones, normalTexture) and the baked primitives' `material`.
+    """
+    import copy
+
+    overrides: Dict[int, Tuple[bytes, str]] = {}
+    additions: List[Tuple[int, bytes, str]] = []
+    tex_refs = _texture_refs(g)
+    img_tex: Dict[int, int] = {}
+    for ti in range(len(g.textures or [])):
+        ii = _texture_image_index(g, ti)
+        if ii is not None:
+            img_tex[ii] = img_tex.get(ii, 0) + 1
+    users: Dict[int, set] = {}
+    for mesh in (g.meshes or []):
+        for prim in mesh.primitives:
+            if prim.material is not None:
+                users.setdefault(prim.material, set()).add(id(prim))
+
+    for entry in baked_maps:
+        m = entry["material"]
+        group = {id(p) for p in entry["prims"]}
+        if not users.get(m, set()) <= group:
+            clone = copy.deepcopy(g.materials[m])
+            clone.name = f"{g.materials[m].name or 'material'}_baked"
+            g.materials.append(clone)
+            m_new = len(g.materials) - 1
+            for p in entry["prims"]:
+                p.material = m_new
+            users[m] = users[m] - group
+            users[m_new] = set(group)
+            m = m_new
+            exclusive = False            # the source image is still in use by the original
+        else:
+            exclusive = True
+        mat = g.materials[m]
+        nt = mat.normalTexture
+        src_img = _texture_image_index(g, nt.index) if nt is not None else None
+        if (exclusive and src_img is not None and src_img not in overrides
+                and img_tex.get(src_img, 0) == 1 and tex_refs.get(nt.index, 0) == 1):
+            overrides[src_img] = (entry["data"], entry["mime"])
+            # the baked map is in TEXCOORD_0 space, untransformed, at unit strength
+            nt.texCoord = 0
+            nt.scale = 1.0
+            if nt.extensions:
+                nt.extensions.pop("KHR_texture_transform", None)
+        else:
+            additions.append((m, entry["data"], entry["mime"]))
+    return overrides, additions
 
 
 # Skin attributes ride the decimation separately from _ATTR_NAMES: they must never go through the
@@ -1456,22 +1857,58 @@ def _read_skin_attrs(g: GLTF2, blob: bytes, at) -> Dict[str, np.ndarray]:
     return out
 
 
+def _resolve_boosts(profile: str, has_skin: bool, lod: bool,
+                    head_boost: Optional[float], hand_boost: Optional[float]
+                    ) -> Tuple[float, float]:
+    """Head/hand importance boosts for a decimation.
+
+    `profile`: "prop" = uniform budget (the warp is the identity), "character" = the humanoid
+    warp, "auto" = character when the file carries a skin, prop otherwise. The warp assumes a
+    Y-up humanoid in an A/T-pose; on a barrel or a wall section it just magnifies whatever happens
+    to be in the top 16% or at the X extremes, so it is never applied unless asked for.
+    Explicit `head_boost` / `hand_boost` override the profile.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"profile must be one of {PROFILES}, got {profile!r}")
+    character = profile == "character" or (profile == "auto" and has_skin)
+    if character:
+        dh, dn = (_LOD_HEAD_BOOST, _LOD_HAND_BOOST) if lod else (_HEAD_BOOST, _HAND_BOOST)
+    else:
+        dh = dn = 1.0
+    return (dh if head_boost is None else float(head_boost),
+            dn if hand_boost is None else float(hand_boost))
+
+
+def _resolve_seam_lock(profile: str, has_skin: bool) -> bool:
+    """Seam fins (`_seam_fins`) for props, not for characters — unless RETOPO_SEAM_LOCK says
+    otherwise. A prop's seams sit on flat faces where a collapse across them is free and visible;
+    the character pipeline was measured and tuned without them (its seams sit on curved skin, and
+    locking ~40% of a generated character's vertices to seams costs budget where it is needed)."""
+    env = os.environ.get("RETOPO_SEAM_LOCK")
+    if env is not None:
+        return env not in ("0", "false", "False")
+    return not (profile == "character" or (profile == "auto" and has_skin))
+
+
 def decimate_source_glb(source_glb_path: str, output_glb_path: str, target_ratio: float = 0.5, *,
                         bake: bool = True,
+                        profile: str = "prop",
                         head_boost: Optional[float] = None,
                         hand_boost: Optional[float] = None) -> Dict:
-    """Write a seam-preserving decimated copy of an UNRIGGED character GLB. `target_ratio` =
-    fraction of triangles to KEEP. Textures/materials/nodes preserved; buffer repacked. Returns
-    stats. Raises ValueError for skinned/animated/morphed inputs (optimize runs before rigging).
+    """Write a seam-preserving decimated copy of an UNRIGGED GLB — a prop, an environment piece or
+    a character before rigging. `target_ratio` = fraction of triangles to KEEP.
+    Textures/materials/nodes preserved; buffer repacked. Returns stats. Raises ValueError for
+    skinned/animated/morphed inputs (optimize runs before rigging).
 
-    `bake=False` skips the normal-map bake (plain decimation). `head_boost` / `hand_boost` steer the
-    humanoid importance warp (None = module defaults; 1.0 for both = uniform budget, e.g. props).
+    `bake=False` skips the normal-map bake (plain decimation). `profile` picks the density
+    allocation: "prop" (default, uniform) or "character" (head and hands keep more of the budget);
+    `head_boost` / `hand_boost` override it.
 
     For the rigged LOD ladder use `decimate_rigged_glb`, which keeps this function's
     "optimize before you rig" contract intact instead of loosening it.
     """
     return _decimate_glb(source_glb_path, output_glb_path, target_ratio=target_ratio, bake=bake,
-                         head_boost=head_boost, hand_boost=hand_boost)
+                         profile=profile, head_boost=head_boost, hand_boost=hand_boost)
 
 
 def _assert_skin_intact(path: str) -> None:
@@ -1522,8 +1959,9 @@ def decimate_rigged_glb(source_glb_path: str, output_glb_path: str, target_trian
                         texture_size: Optional[int] = None, bake: bool = True,
                         bake_reference: Optional[str] = None,
                         head_boost: Optional[float] = None,
-                        hand_boost: Optional[float] = None) -> Dict:
-    """Write a lower-resolution LOD of a RIGGED character GLB, keeping the skin intact.
+                        hand_boost: Optional[float] = None,
+                        profile: str = "auto") -> Dict:
+    """Write one LOD of a GLB — rigged or not — keeping any skin intact.
 
     The same seam-preserving collapse as the unrigged path. Skin is resolved PER OUTPUT WELDED
     VERTEX and blended over the collapse cluster (see `_blend_skin_over_clusters` and the note at
@@ -1533,30 +1971,139 @@ def decimate_rigged_glb(source_glb_path: str, output_glb_path: str, target_trian
     Every static check passed throughout, because the split copies are duplicate vertices rather
     than neighbours across an edge.
 
-    `head_boost` / `hand_boost` steer the importance warp. They default LOWER here than the module
-    constants the 400k Optimize step uses: the warp's cost scales with how scarce the budget is, and
-    at LOD resolutions the head boost was buying ~0.03 mm of head p95 with ~0.31 mm of body p95.
+    `profile="auto"` uses the humanoid head/hand warp for a skinned file and a uniform budget
+    otherwise. The character boosts default LOWER here than for the 400k Optimize step: the warp's
+    cost scales with how scarce the budget is, and at LOD resolutions the head boost was buying
+    ~0.03 mm of head p95 with ~0.31 mm of body p95.
 
-    `bake_reference` is the mesh to bake the normal map FROM; pass the full-resolution rig so each
-    rung of the ladder is baked against the best available surface rather than against the rung
-    above it. `texture_size` downscales base colour / metallic-roughness and sets the bake
-    resolution.
+    `bake_reference` is the mesh to bake the normal map FROM, matched primitive by primitive (same
+    mesh and primitive index); pass the full-resolution source so each rung of the ladder is baked
+    against the best available surface rather than against the rung above it. `texture_size`
+    downscales the textures and sets the bake resolution.
 
     The skeleton is untouched: `skins[0].joints`, the node hierarchy and the inverse-bind data all
     ride through unchanged (the IBM ACCESSOR INDEX is re-pointed, which the repack must do and is
     the single most destructive thing to get wrong here).
     """
-    return _decimate_glb(source_glb_path, output_glb_path,
-                         head_boost=_LOD_HEAD_BOOST if head_boost is None else head_boost,
-                         hand_boost=_LOD_HAND_BOOST if hand_boost is None else hand_boost,
+    return _decimate_glb(source_glb_path, output_glb_path, lod=True, profile=profile,
+                         head_boost=head_boost, hand_boost=hand_boost,
                          target_triangles=int(target_triangles), allow_skin=True,
                          texture_size=texture_size, bake=bake, bake_reference=bake_reference)
+
+
+# Every attribute the decimator treats as SHADING data: read as float (normalized integers
+# rescaled), re-derived where it has to be (UVs resampled, NORMAL/TANGENT re-baked) and written
+# back as FLOAT. Any other attribute (TEXCOORD_n beyond these, COLOR_1, `_CUSTOM`/`_FEATURE_ID_0`)
+# is carried as an exact per-vertex copy in its original component type.
+def _is_shading_attr(name: str) -> bool:
+    return name in ("NORMAL", "TANGENT") or name.startswith("TEXCOORD_") or name.startswith("COLOR_")
+
+
+def _dequantize(g: GLTF2, idx: int, arr: np.ndarray, force: bool = False) -> np.ndarray:
+    """Integer accessor -> float32, honouring `normalized` (KHR_mesh_quantization): a normalized
+    signed value maps to max(c / max, -1), an unsigned one to c / max, a non-normalized one is
+    taken at face value."""
+    if not np.issubdtype(arr.dtype, np.integer):
+        return arr.astype(np.float32)
+    if force or getattr(g.accessors[idx], "normalized", False):
+        out = arr.astype(np.float32) / np.iinfo(arr.dtype).max
+        return np.maximum(out, -1.0) if np.issubdtype(arr.dtype, np.signedinteger) else out
+    return arr.astype(np.float32)
+
+
+def _read_position(g: GLTF2, blob: bytes, idx: int) -> np.ndarray:
+    return _dequantize(g, idx, _acc(g, blob, idx))
+
+
+def _read_float_attr(g: GLTF2, blob: bytes, name: str, idx: int) -> np.ndarray:
+    # COLOR_n integers are normalized by definition, flag or not
+    return _dequantize(g, idx, _acc(g, blob, idx), force=name.startswith("COLOR_"))
+
+
+def _prim_attr_names(prim) -> List[str]:
+    return [k for k, v in vars(prim.attributes).items() if v is not None and k != "POSITION"]
+
+
+def _decimate_mesh_jointly(parts: List[Dict], target_ratio: float, stats: Dict,
+                           head_boost: Optional[float], hand_boost: Optional[float],
+                           seam_lock: bool = False) -> List[Optional[Dict]]:
+    """Decimate every triangle primitive of ONE mesh together, then split the result back.
+
+    A multi-material mesh is one surface cut into primitives along material borders. Decimated one
+    primitive at a time, each side of a border collapses on its own schedule and the border opens
+    into a crack (measured on a two-material crate: 55 boundary edges at 10%). Concatenated, the
+    weld joins the two sides of every border exactly like a UV seam, the collapse moves them in
+    lockstep, and each output face goes back to the primitive its ancestor face came from — raw
+    vertices never cross primitives, so neither can the island-constrained wedge re-split.
+
+    `parts`: [{"P", "F", "attrs"}] per primitive. Returns, per part, {"pos", "faces", "attrs"} or
+    None where that primitive lost every face (the caller keeps the original) — or None for the
+    whole mesh when it is too small to decimate.
+    """
+    sizes = [len(p["P"]) for p in parts]
+    offs = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+    P = np.concatenate([p["P"] for p in parts]).astype(np.float32)
+    F = np.concatenate([p["F"] + offs[i] for i, p in enumerate(parts)])
+    owner = np.repeat(np.arange(len(parts)), sizes)
+
+    # Union of attribute names; a part without one is zero-filled (and never written back), widths
+    # are padded to the widest (COLOR_0 VEC3 + VEC4 -> VEC4 with alpha 1) and sliced back on output.
+    names: List[str] = []
+    for p in parts:
+        names += [n for n in p["attrs"] if n not in names]
+    attrs: Dict[str, np.ndarray] = {}
+    for n in names:
+        arrs = [p["attrs"].get(n) for p in parts]
+        width = max(1 if a.ndim == 1 else a.shape[1] for a in arrs if a is not None)
+        dtype = np.result_type(*[a.dtype for a in arrs if a is not None])
+        cols = []
+        for a, sz in zip(arrs, sizes):
+            if a is None:
+                cols.append(np.zeros((sz, width), dtype=dtype))
+                continue
+            a2 = a.reshape(sz, -1).astype(dtype, copy=False)
+            if a2.shape[1] < width:
+                pad = np.zeros((sz, width - a2.shape[1]), dtype=dtype)
+                if n.startswith("COLOR_"):
+                    pad[:] = 1
+                a2 = np.concatenate([a2, pad], axis=1)
+            cols.append(a2)
+        cat = np.concatenate(cols)
+        attrs[n] = cat.reshape(-1) if width == 1 and all(
+            a is None or a.ndim == 1 for a in arrs) else cat
+
+    res = _decimate_primitive(P, F, attrs, target_ratio, stats=stats, head_boost=head_boost,
+                              hand_boost=hand_boost, return_source=True, seam_lock=seam_lock,
+                              labels=owner if len(parts) > 1 else None)
+    if res is None:
+        return [None] * len(parts)
+    pos, faces, a_out, vr = res
+    v_owner = owner[vr]
+    f_owner = v_owner[faces[:, 0]]
+    out: List[Optional[Dict]] = []
+    for i, p in enumerate(parts):
+        fi = faces[f_owner == i]
+        if len(fi) == 0:
+            out.append(None)
+            continue
+        used, inv = np.unique(fi.reshape(-1), return_inverse=True)
+        pa = {}
+        for n, a in p["attrs"].items():
+            src = a_out[n][used].reshape(len(used), -1)
+            src = src[:, 0] if a.ndim == 1 else src[:, :a.shape[1]]
+            if not _is_shading_attr(n) and n not in _SKIN_NAMES:
+                src = src.astype(a.dtype)          # custom attributes keep their exact values
+            pa[n] = src
+        out.append({"pos": pos[used], "faces": inv.reshape(-1, 3).astype(np.int64), "attrs": pa})
+    return out
 
 
 def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
                   target_ratio: float = 0.5,
                   target_triangles: Optional[int] = None,
                   allow_skin: bool = False,
+                  lod: bool = False,
+                  profile: str = "prop",
                   texture_size: Optional[int] = None,
                   bake: bool = True,
                   bake_reference: Optional[str] = None,
@@ -1566,9 +2113,19 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
     skin's inverse-bind accessor; everything else is identical for both entry points."""
     if not os.path.exists(source_glb_path):
         raise FileNotFoundError(source_glb_path)
+    # pygltflib dispatches save/load on the FILE EXTENSION: anything but `.glb` is written as a
+    # JSON glTF plus a `.bin` sidecar, which loads back with no binary blob and no error. That is
+    # exactly how an atomic-publish temp name like `foo.glb.tmp` silently produced a non-GLB.
+    # Checked up front so a bad path costs nothing.
+    if not output_glb_path.lower().endswith(".glb"):
+        raise ValueError(f"output must end in .glb (pygltflib writes anything else as JSON+bin): "
+                         f"{output_glb_path}")
 
     g = GLTF2().load(source_glb_path)
     blob = g.binary_blob()
+    if blob is None:
+        raise ValueError(f"{source_glb_path} has no binary chunk — only self-contained .glb "
+                         "files are supported")
     orig_size = os.path.getsize(source_glb_path)
     if g.animations:
         raise ValueError("mesh is animated — the repack does not re-index animation samplers")
@@ -1587,14 +2144,20 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
                 if getattr(prim.attributes, "JOINTS_1", None) is not None:
                     raise ValueError("mesh has 8 skin influences (JOINTS_1); this path handles 4 "
                                      "— merging the two weight sets is not implemented")
+    head_boost, hand_boost = _resolve_boosts(profile, bool(g.skins), lod, head_boost, hand_boost)
+    seam_lock = _resolve_seam_lock(profile, bool(g.skins))
+
+    def _is_tri(prim) -> bool:
+        if prim.attributes.POSITION is None or (prim.mode if prim.mode is not None else 4) != 4:
+            return False
+        n = (g.accessors[prim.indices].count if prim.indices is not None
+             else g.accessors[prim.attributes.POSITION].count)
+        return n % 3 == 0 and n > 0
+
     if target_triangles is not None:
-        total = 0
-        for mesh in (g.meshes or []):
-            for prim in mesh.primitives:
-                if prim.attributes.POSITION is None:
-                    continue
-                total += ((g.accessors[prim.indices].count // 3) if prim.indices is not None
-                          else g.accessors[prim.attributes.POSITION].count // 3)
+        total = sum((g.accessors[p.indices].count if p.indices is not None
+                     else g.accessors[p.attributes.POSITION].count) // 3
+                    for m in (g.meshes or []) for p in m.primitives if _is_tri(p))
         if total <= 0:
             raise ValueError("nothing to decimate (no triangle geometry found)")
         target_ratio = target_triangles / float(total)
@@ -1603,9 +2166,12 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
     # silently corrupted file): sparse accessors, compressed/instanced extensions, extra buffers.
     if len(g.buffers or []) > 1:
         raise ValueError("multi-buffer GLB — cannot optimize safely")
-    unsupported_exts = {"KHR_draco_mesh_compression", "EXT_mesh_gpu_instancing"} & set(g.extensionsUsed or [])
+    unsupported_exts = {"KHR_draco_mesh_compression", "EXT_meshopt_compression",
+                        "KHR_meshopt_compression", "EXT_mesh_gpu_instancing"} & set(
+        (g.extensionsUsed or []) + (g.extensionsRequired or []))
     if unsupported_exts:
-        raise ValueError(f"unsupported GLB extensions: {sorted(unsupported_exts)} — cannot optimize safely")
+        raise ValueError(f"unsupported GLB extensions: {sorted(unsupported_exts)} — decompress "
+                         "the file first (e.g. `gltf-transform copy in.glb out.glb`)")
     for a in (g.accessors or []):
         if getattr(a, "sparse", None):
             raise ValueError("sparse accessors — cannot optimize safely")
@@ -1614,92 +2180,98 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
             if prim.targets:
                 raise ValueError("mesh has morph targets — cannot optimize safely")
 
-    _ATTR_NAMES = ("NORMAL", "TANGENT", "TEXCOORD_0", "TEXCOORD_1", "COLOR_0")
     tri_before = tri_after = vert_before = vert_after = 0
     plans: List[Dict] = []
     density: List[Dict] = []
-    replaced: set = set()
     total_verts = 0
-    for mesh in (g.meshes or []):
-        for prim in mesh.primitives:
+    for mi, mesh in enumerate(g.meshes or []):
+        parts: List[Dict] = []
+        for pi, prim in enumerate(mesh.primitives):
             at = prim.attributes
             if at.POSITION is None:
                 continue
-            P = _acc(g, blob, at.POSITION).astype(np.float32)
-            total_verts += len(P)
+            n_pos = g.accessors[at.POSITION].count
+            total_verts += n_pos
             if total_verts > MAX_TOTAL_VERTS:
                 raise ValueError(f"mesh too large to optimize: >{MAX_TOTAL_VERTS} vertices")
+            vert_before += n_pos
             # only plain indexed/soup TRIANGLES (mode 4) decimate; strips/fans/lines/points and
-            # non-multiple-of-3 counts pass through verbatim (their accessors are copied in step 2b)
-            mode = prim.mode if prim.mode is not None else 4
-            n_idx = g.accessors[prim.indices].count if prim.indices is not None else len(P)
-            if mode != 4 or n_idx % 3 != 0:
-                vert_before += len(P)
-                vert_after += len(P)
+            # non-multiple-of-3 counts pass through verbatim
+            if not _is_tri(prim):
+                vert_after += n_pos
                 continue
-            if prim.indices is not None:
-                F = _acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
-            else:
-                F = np.arange(len(P), dtype=np.int64).reshape(-1, 3)
-            vert_before += len(P)
+            P = _read_position(g, blob, at.POSITION)
+            F = (_acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
+                 if prim.indices is not None else np.arange(len(P), dtype=np.int64).reshape(-1, 3))
             tri_before += len(F)
+            if F.max() >= len(P) or F.min() < 0:
+                raise ValueError(f"mesh {mi} primitive {pi}: index out of range")
+            # Only the vertices the faces use. Several exporters give every primitive of a mesh
+            # the SAME vertex arrays and a different index buffer; carried whole, each primitive
+            # would drag every other primitive's vertices into its weld.
+            used, F_local = np.unique(F.reshape(-1), return_inverse=True)
+            F_local = F_local.reshape(-1, 3).astype(np.int64)
             attrs: Dict[str, np.ndarray] = {}
-            for name in _ATTR_NAMES:
-                a_idx = getattr(at, name, None)
-                if a_idx is not None:
-                    arr = _acc(g, blob, a_idx)
-                    if np.issubdtype(arr.dtype, np.integer):   # normalized ubyte/ushort -> float 0-1
-                        arr = arr.astype(np.float32) / np.iinfo(arr.dtype).max
-                    attrs[name] = arr
+            meta: Dict[str, Tuple[int, str, bool]] = {}
+            for name in _prim_attr_names(prim):
+                a_idx = getattr(at, name)
+                if name in _SKIN_NAMES:
+                    continue
+                if _is_shading_attr(name):
+                    attrs[name] = _read_float_attr(g, blob, name, a_idx)[used]
+                else:
+                    acc = g.accessors[a_idx]
+                    attrs[name] = _acc(g, blob, a_idx)[used]
+                    meta[name] = (acc.componentType, acc.type, bool(acc.normalized))
             # Skin rides in the SAME attrs dict so it goes through the same exact-copy gather
-            # (`arr[vr]`) as the shading attributes — never interpolated, never nearest-neighbour
-            # transferred. That is what keeps weight rows summing to 1 with no renormalization and
-            # stops a collapse inventing a joint the vertex never had.
-            skin_in = _read_skin_attrs(g, blob, at) if allow_skin else {}
+            # (`arr[vr]`) as the shading attributes — never nearest-neighbour transferred.
+            skin_in = ({k: v[used] for k, v in _read_skin_attrs(g, blob, at).items()}
+                       if allow_skin else {})
             attrs.update(skin_in)
-            prim_stats: Dict = {}
-            result = _decimate_primitive(P, F, attrs, target_ratio, stats=prim_stats,
-                                         head_boost=head_boost, hand_boost=hand_boost)
-            if result is None:
-                vert_after += len(P)
-                tri_after += len(F)
+            parts.append({"pi": pi, "prim": prim, "P": P[used], "F": F_local, "attrs": attrs,
+                          "meta": meta, "n_pos": n_pos})
+        if not parts:
+            continue
+        mesh_stats_d: Dict = {}
+        results = _decimate_mesh_jointly(parts, target_ratio, mesh_stats_d, head_boost, hand_boost,
+                                         seam_lock=seam_lock)
+        if any(r is not None for r in results):
+            density.append(mesh_stats_d)
+        for part, r in zip(parts, results):
+            if r is None:
+                vert_after += part["n_pos"]
+                tri_after += len(part["F"])
                 continue
-            pos_out, faces_out, attrs_out = result
-            skin_out = {k: attrs_out.pop(k) for k in list(attrs_out) if k in _SKIN_NAMES}
-            vert_after += len(pos_out)
-            tri_after += len(faces_out)
-            density.append(prim_stats)
-            plans.append({"prim": prim, "pos": pos_out, "faces": faces_out, "attrs": attrs_out,
-                          "skin": skin_out, "P": P, "F": F,
-                          "attrs_in": {k: v for k, v in attrs.items() if k not in _SKIN_NAMES}})
-            # JOINTS_*/WEIGHTS_* MUST be retired too: leaving them out means the decimated
-            # primitive keeps an accessor index at the OLD vertex count while POSITION is the new
-            # short one — a count mismatch that no reader accepts.
-            retire = [at.POSITION, prim.indices] + [getattr(at, n, None) for n in _ATTR_NAMES]
-            if allow_skin:
-                retire += [getattr(at, n, None) for n in _SKIN_NAMES]
-            for a_idx in retire:
-                if a_idx is not None:
-                    replaced.add(a_idx)
+            a_out = dict(r["attrs"])
+            skin_out = {k: a_out.pop(k) for k in list(a_out) if k in _SKIN_NAMES}
+            vert_after += len(r["pos"])
+            tri_after += len(r["faces"])
+            plans.append({"prim": part["prim"], "key": (mi, part["pi"]), "pos": r["pos"],
+                          "faces": r["faces"], "attrs": a_out, "skin": skin_out,
+                          "meta": part["meta"], "P": part["P"], "F": part["F"],
+                          "attrs_in": {k: v for k, v in part["attrs"].items()
+                                       if k not in _SKIN_NAMES}})
 
     if not plans:
-        raise ValueError("nothing to decimate (no dense unrigged primitives found)")
+        raise NothingToDecimate("nothing to decimate (no triangle primitive is large enough — "
+                         "at least 64 faces — to reduce)")
 
     # ---- bake the removed relief into the normal map, before anything is written ----
-    # Gated so a failure here degrades to plain decimation (the old behaviour) rather than losing
-    # the user's optimize entirely; RETOPO_OPT_BAKE_NORMALS=0 turns it off outright.
+    # Gated so a failure here degrades to plain decimation rather than losing the optimize
+    # entirely; RETOPO_OPT_BAKE_NORMALS=0 turns it off outright.
     bake_stats: Dict = {"normal_map_baked": False, "bake_resolution": None}
-    image_overrides: Dict[int, bytes] = {}
-    image_additions: List[Tuple[int, bytes]] = []
+    baked_maps: List[Dict] = []
     if bake and os.environ.get("RETOPO_OPT_BAKE_NORMALS", "1") not in ("0", "false", "False"):
         try:
-            bake_stats, image_overrides, image_additions = _bake_stage(
-                g, blob, plans, reference_glb=bake_reference, res_hint=texture_size)
+            bake_stats, baked_maps = _bake_stage(g, blob, plans, reference_glb=bake_reference,
+                                                 res_hint=texture_size)
         except Exception:
             logger.exception("retopotool: normal-map bake failed; writing the decimated mesh "
                              "with its original shading attributes")
             bake_stats = {"normal_map_baked": False, "bake_resolution": None,
                           "bake_error": "bake failed — see logs"}
+            baked_maps = []
+    image_overrides, image_additions = _assign_baked_maps(g, baked_maps)
     for plan in plans:      # the high-poly arrays are only needed by the bake; free them now
         plan.pop("P", None)
         plan.pop("F", None)
@@ -1723,10 +2295,10 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
         data = np.ascontiguousarray(arr, dtype=_CT[comp])
         bv = add_view(data.tobytes())
         a = Accessor(bufferView=bv, byteOffset=0, componentType=comp, count=len(data), type=gtype,
-                     normalized=bool(normalized))
+                     normalized=bool(normalized) or None)
         if minmax:
-            a.min = data.min(0).tolist() if data.ndim > 1 else [float(data.min())]
-            a.max = data.max(0).tolist() if data.ndim > 1 else [float(data.max())]
+            a.min = data.min(0).tolist() if data.ndim > 1 else [data.min().item()]
+            a.max = data.max(0).tolist() if data.ndim > 1 else [data.max().item()]
         new_accessors.append(a)
         return len(new_accessors) - 1
 
@@ -1734,16 +2306,17 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
     img_mime: Dict[int, str] = {}
     for i, img in enumerate(g.images or []):
         if i in image_overrides:                      # baked normal map replaces the source one
-            img_view[i] = add_view(image_overrides[i])
-            img_mime[i] = "image/png"
+            data, mime = image_overrides[i]
+            img_view[i] = add_view(data)
+            img_mime[i] = mime
             continue
         if img.bufferView is None:
             continue
         bv = g.bufferViews[img.bufferView]
         raw = bytes(blob[(bv.byteOffset or 0):(bv.byteOffset or 0) + bv.byteLength])
         if texture_size:
-            # Reuses the export optimizer's resizer (Pillow LANCZOS, JPEG q90 / PNG). The normal map
-            # is NOT resampled here — it comes out of the bake already at the target resolution.
+            # Pillow LANCZOS, JPEG q90 / PNG. A baked normal map is NOT resampled here — it comes
+            # out of the bake already at the target resolution.
             mime = img.mimeType or ("image/jpeg" if raw[:2] == b"\xff\xd8" else "image/png")
             try:
                 smaller = _resize_image(raw, mime, int(texture_size))
@@ -1757,21 +2330,19 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
                 img_mime[i] = "image/jpeg" if ("jpeg" in mime or "jpg" in mime) else "image/png"
         img_view[i] = add_view(raw)
 
-    # Copy only accessors something still POINTS AT. The old loop copied all of them, which
-    # faithfully carried orphans into the output: rig writers that append to the source buffer
-    # instead of repacking leave the pre-rig POSITION/NORMAL/TANGENT
-    # still in the file — 9.0 MB, 24.8% of a 38 MB rig — referenced by nothing. Dropping them is
-    # most of the reason an LOD is small; without this a 15k-triangle LOD still weighed 11 MB.
+    # Copy only accessors something still POINTS AT: the primitives that were NOT replaced (all of
+    # their attributes, whatever their names) and the skin's inverse-bind matrices. Rig writers
+    # that append to the buffer instead of repacking leave the pre-rig POSITION/NORMAL/TANGENT
+    # behind — 9.0 MB, 24.8% of a 38 MB rig — referenced by nothing; dropping them is most of the
+    # reason an LOD is small. An accessor a replaced primitive SHARES with a kept one (a line
+    # primitive indexing the same vertex array, a primitive too small to decimate) stays.
+    decimated_prims = {id(plan["prim"]) for plan in plans}
     referenced: set = set()
     for mesh in (g.meshes or []):
         for prim in mesh.primitives:
-            if id(prim) in {id(p["prim"]) for p in plans}:
-                continue                       # its accessors are being replaced wholesale
-            at = prim.attributes
-            for name in ("POSITION",) + _ATTR_NAMES + _SKIN_NAMES:
-                v = getattr(at, name, None)
-                if v is not None:
-                    referenced.add(v)
+            if id(prim) in decimated_prims:
+                continue
+            referenced.update(v for k, v in vars(prim.attributes).items() if v is not None)
             if prim.indices is not None:
                 referenced.add(prim.indices)
     for skin in (g.skins or []):
@@ -1781,28 +2352,28 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
     acc_map: Dict[int, int] = {}
     dropped_orphans = 0
     for old_idx, a in enumerate(g.accessors or []):
-        if old_idx in replaced:
-            continue
         if old_idx not in referenced:
             dropped_orphans += 1
+            continue
+        if a.bufferView is None:
+            # all-zeros accessor: no data to move, keep it as declared
+            new_accessors.append(Accessor(componentType=a.componentType, count=a.count,
+                                          type=a.type, normalized=a.normalized, min=a.min,
+                                          max=a.max))
+            acc_map[old_idx] = len(new_accessors) - 1
             continue
         arr = _acc(g, blob, old_idx)
         acc_map[old_idx] = add_accessor(arr, a.componentType, a.type, minmax=a.min is not None,
                                         normalized=bool(a.normalized))
     if dropped_orphans:
-        logger.info("retopotool: dropped %d orphaned accessor(s)", dropped_orphans)
+        logger.info("retopotool: dropped %d unreferenced or replaced accessor(s)", dropped_orphans)
 
-    decimated_prims = {id(plan["prim"]) for plan in plans}
     for mesh in (g.meshes or []):
         for prim in mesh.primitives:
             if id(prim) in decimated_prims:
                 continue
             at = prim.attributes
-            # All four skin names, not just set 0: `JOINTS_1`/`WEIGHTS_1` on a primitive that was
-            # NOT decimated were collected as referenced but never re-pointed, so they kept an index
-            # into the pre-repack accessor table — cross-wired or out of range.
-            for name in ("POSITION",) + _ATTR_NAMES + _SKIN_NAMES:
-                v = getattr(at, name, None)
+            for name, v in list(vars(at).items()):
                 if v is not None and v in acc_map:
                     setattr(at, name, acc_map[v])
             if prim.indices is not None and prim.indices in acc_map:
@@ -1813,6 +2384,8 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
             if i in img_mime:
                 img.mimeType = img_mime[i]
                 img.uri = None
+                if img_mime[i] == "image/webp":
+                    continue
                 # An EXT_texture_webp texture now points at PNG bytes; rewire it to the core slot
                 # or every reader that honours the extension decodes a PNG as WebP.
                 for tex in (g.textures or []):
@@ -1821,16 +2394,26 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
                         tex.source = i
                         tex.extensions.pop("EXT_texture_webp", None)
 
-    # Materials that had no normal map at all get a freshly minted image/texture/slot.
-    for mat_idx, png in image_additions:
-        bv = add_view(png)
+    # Materials that need a fresh map (no normal map before, or one that other materials share).
+    for mat_idx, data, mime in image_additions:
+        bv = add_view(data)
         g.images = list(g.images or [])
-        g.images.append(Image(bufferView=bv, mimeType="image/png",
-                              name=f"baked_normal_{mat_idx}"))
+        g.images.append(Image(bufferView=bv, mimeType=mime, name=f"baked_normal_{mat_idx}"))
         g.textures = list(g.textures or [])
-        g.textures.append(Texture(source=len(g.images) - 1))
+        old = g.materials[mat_idx].normalTexture
+        sampler = (g.textures[old.index].sampler
+                   if old is not None and old.index is not None and old.index < len(g.textures)
+                   else None)
+        if mime == "image/webp":
+            # WebP only ever comes back for a source map that was WebP, so the file already
+            # declares the extension; reference it the way that extension requires.
+            g.textures.append(Texture(sampler=sampler, extensions={
+                "EXT_texture_webp": {"source": len(g.images) - 1}}))
+            g.extensionsUsed = sorted(set((g.extensionsUsed or []) + ["EXT_texture_webp"]))
+        else:
+            g.textures.append(Texture(source=len(g.images) - 1, sampler=sampler))
         g.materials[mat_idx].normalTexture = NormalMaterialTexture(
-            index=len(g.textures) - 1, scale=1.0)
+            index=len(g.textures) - 1, scale=1.0, texCoord=0)
 
     # Drop EXT_texture_webp from the declaration once no texture uses it any more — leaving it in
     # extensionsRequired forces every reader to support a codec the file no longer contains.
@@ -1840,15 +2423,24 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
             if cur and "EXT_texture_webp" in cur:
                 setattr(g, lst, [e for e in cur if e != "EXT_texture_webp"])
 
-    _GT = {"NORMAL": "VEC3", "TANGENT": "VEC4", "TEXCOORD_0": "VEC2", "TEXCOORD_1": "VEC2", "COLOR_0": "VEC4"}
+    _GT = {1: "SCALAR", 2: "VEC2", 3: "VEC3", 4: "VEC4"}
     for plan in plans:
         prim = plan["prim"]
+        meta = plan.get("meta", {})
+        # Every attribute slot is rewritten from the plan; anything the plan does not carry would be
+        # left holding an index into the OLD accessor table.
+        for name in list(vars(prim.attributes)):
+            if name != "POSITION":
+                setattr(prim.attributes, name, None)
         prim.attributes.POSITION = add_accessor(plan["pos"], FLOAT, "VEC3", minmax=True)
         for name, arr in plan["attrs"].items():
-            gtype = _GT.get(name) or ("VEC4" if arr.ndim > 1 and arr.shape[1] == 4 else "VEC3")
-            if arr.ndim > 1 and arr.shape[1] != int(gtype[-1]):
-                gtype = {2: "VEC2", 3: "VEC3", 4: "VEC4"}[arr.shape[1]]
-            setattr(prim.attributes, name, add_accessor(arr.astype(np.float32), FLOAT, gtype))
+            if name in meta:                          # custom attribute: original encoding
+                comp, gtype, normd = meta[name]
+                setattr(prim.attributes, name, add_accessor(arr, comp, gtype, normalized=normd))
+                continue
+            width = 1 if arr.ndim == 1 else arr.shape[1]
+            setattr(prim.attributes, name,
+                    add_accessor(arr.astype(np.float32), FLOAT, _GT[width]))
         # Skin: written with the RIGHT component types, not the FLOAT every other attribute gets.
         # glTF allows JOINTS_n only as UNSIGNED_BYTE/UNSIGNED_SHORT; a float VEC4 there is invalid
         # and three.js will not bind it.
@@ -1871,6 +2463,7 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
         n_verts = len(plan["pos"])
         icomp = UNSIGNED_SHORT if n_verts <= 65535 else UNSIGNED_INT
         prim.indices = add_accessor(plan["faces"].reshape(-1), icomp, "SCALAR")
+        prim.mode = None                                  # TRIANGLES, the default
 
     # THE trap of this whole path: the repack rebuilds `g.accessors` from scratch, so every index
     # held OUTSIDE a primitive has to be re-pointed. `skin.inverseBindMatrices` is the only one, and
@@ -1890,12 +2483,6 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
     g.accessors = new_accessors
     g.buffers = [Buffer(byteLength=len(new_blob))]
     g.set_binary_blob(bytes(new_blob))
-    # pygltflib dispatches save/load on the FILE EXTENSION: anything but `.glb` is written as a
-    # JSON glTF plus a `.bin` sidecar, which loads back with no binary blob and no error. That is
-    # exactly how an atomic-publish temp name like `foo.glb.tmp` silently produced a non-GLB.
-    if not output_glb_path.lower().endswith(".glb"):
-        raise ValueError(f"output must end in .glb (pygltflib writes anything else as JSON+bin): "
-                         f"{output_glb_path}")
     os.makedirs(os.path.dirname(output_glb_path) or ".", exist_ok=True)
     g.save(output_glb_path)
 
@@ -1910,6 +2497,14 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
         "vertices_before": int(vert_before),
         "vertices_after": int(vert_after),
         "target_ratio": target_ratio,
+        "target_triangles": int(round(target_ratio * tri_before)),
+        # Seam fins keep the texture from smearing; on a seam-dense piece (a low-poly kit part where
+        # most edges are UV or hard-edge seams) they also stop the reduction above the target, and
+        # that is the honest result — the alternative is the smeared decal.
+        "seam_lock": bool(seam_lock),
+        "seam_limited": bool(seam_lock and tri_after > 1.25 * target_ratio * tri_before),
+        "head_boost": head_boost,
+        "hand_boost": hand_boost,
         # Share of surviving vertices that lie in the head band — the number the importance warp
         # exists to raise (uniform QEM lands around 0.12-0.21 on a full body, the warp 0.35-0.40).
         "head_vertex_share": (
@@ -1917,12 +2512,14 @@ def _decimate_glb(source_glb_path: str, output_glb_path: str, *,
                            if "head_vertex_share_after" in d]))
             if any("head_vertex_share_after" in d for d in density) else None
         ),
-        # Quality telemetry. Everything below was already computed per primitive and thrown away,
-        # which is why a bad rung was indistinguishable from a good one without measuring the file
-        # by hand. `ancestor_faces` is deliberately NOT included: it is a per-face ndarray and this
-        # dict is meant to be JSON-serialized (e.g. into an LOD ladder record).
+        # Quality telemetry. `ancestor_faces` is deliberately NOT included: it is a per-face
+        # ndarray and this dict is meant to be JSON-serialized (e.g. into an LOD ladder record).
         "quality": _summarize_quality(density, plans),
         **bake_stats,
     }
+    if stats["seam_limited"]:
+        logger.warning("retopotool: %s stopped at %d triangles (target %d): its UV / hard-edge "
+                       "seams cannot be reduced further without smearing the texture",
+                       source_glb_path, tri_after, stats["target_triangles"])
     logger.info("Decimated %s -> %s (%s)", source_glb_path, output_glb_path, stats)
     return stats

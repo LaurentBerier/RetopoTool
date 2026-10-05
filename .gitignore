@@ -10,3 +10,4 @@ venv/
 *.gltf
 *.png
 !docs/**/*.png
+.scratch/

@@ -173,13 +173,8 @@ def test_importance_warp_gives_the_head_more_of_the_budget(sphere, tmpdir_mod):
     src = _write_glb(os.path.join(tmpdir_mod, "warp_src.glb"), V, F, UV, N)
     dst_on = os.path.join(tmpdir_mod, "warp_on.glb")
     dst_off = os.path.join(tmpdir_mod, "warp_off.glb")
-    st_on = D.decimate_source_glb(src, dst_on, 0.25)
-    old_head, old_hand = D._HEAD_BOOST, D._HAND_BOOST
-    D._HEAD_BOOST, D._HAND_BOOST = 1.0, 1.0          # uniform allocation
-    try:
-        st_off = D.decimate_source_glb(src, dst_off, 0.25)
-    finally:
-        D._HEAD_BOOST, D._HAND_BOOST = old_head, old_hand
+    st_on = D.decimate_source_glb(src, dst_on, 0.25, profile="character")
+    st_off = D.decimate_source_glb(src, dst_off, 0.25, profile="prop")     # uniform allocation
 
     # The gain is modest on this fixture and large on a real character (measured 13.8% -> 22.7%,
     # i.e. 1.64x, on the reported 3.0M-tri upload): the test sphere concentrates its fine relief

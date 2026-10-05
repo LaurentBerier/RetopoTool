@@ -58,10 +58,18 @@ BAKE_MAX_RES = 4096
 # BAKE_MIN_RES — there the map is the whole point and a 512 or 1024 map is the shipping size. This
 # is the floor below which the bake stops being worth its runtime at all.
 BAKE_HARD_MIN = 256
-# Cage half-height as a fraction of the model's bbox height. The low-poly is a vertex SUBSET of the
-# high-poly, so the two surfaces are never far apart; 1% of height (~1.8 cm on a human) covers the
+# Cage half-height as a fraction of the model's LARGEST bbox extent. The low-poly is a vertex SUBSET
+# of the high-poly, so the two surfaces are never far apart; 1% (~1.8 cm on a human) covers the
 # deepest decimated-away cavity while staying well under the gap between an arm and the torso.
+# The largest extent, not the Y extent: a floor tile or a wall panel lying in a plane has almost no
+# height, and a cage sized from it misses ~80% of its rays.
 CAGE_FRAC = 0.01
+# Low-poly vertices at one position share a smoothed normal only if the normals they CARRY (copied
+# from the source by the decimator) agree within this angle. Wider than that is a hard edge the
+# artist authored - a crate corner, a bevel, a panel line - and averaging across it turns a prop
+# into a soap bar. Narrower differences come from the decimator itself (a corner that kept an
+# ancestor's attributes after a long collapse) and are smoothed.
+HARD_EDGE_DEG = 35.0
 # A hit only counts if the high-poly normal there agrees with the low-poly normal. Without it a ray
 # leaving a thin surface can register on the far side of a limb.
 NORMAL_AGREE = 0.0
@@ -72,17 +80,29 @@ DILATE_PX = 16
 MIN_Z = 0.05
 
 
-def _smooth_normals(P: np.ndarray, F: np.ndarray) -> np.ndarray:
+def _smooth_normals(P: np.ndarray, F: np.ndarray, guide: Optional[np.ndarray] = None,
+                    hard_edge_deg: float = HARD_EDGE_DEG) -> np.ndarray:
     """Area-weighted vertex normals computed on the POSITION-WELDED mesh, scattered back to the
     split vertices. Welding matters: computed per split vertex, every UV seam would shade as a
-    hard crease."""
+    hard crease.
+
+    `guide` (per split vertex, typically the normals the decimator carried over from the source)
+    keeps the source's HARD EDGES: a face only contributes to a split vertex when the guide normal
+    at its own corner agrees with that vertex's guide within `hard_edge_deg`. Without it every
+    coincident vertex is smoothed together, which is right for an organic character and wrong for
+    nearly every prop."""
     tol = max(float(np.linalg.norm(P.max(0) - P.min(0))), 1e-6) * 1e-6
     _, weld = np.unique(np.round(P.astype(np.float64) / tol).astype(np.int64),
                         axis=0, return_inverse=True)
+    weld = weld.reshape(-1)
     Fw = weld[F]
     e1 = P[F[:, 1]] - P[F[:, 0]]
     e2 = P[F[:, 2]] - P[F[:, 0]]
     fn = np.cross(e1, e2)                      # length = 2 * area -> area weighting for free
+    if guide is not None:
+        n = _guided_normals(P, F, weld, fn, guide, hard_edge_deg)
+        if n is not None:
+            return n
     acc = np.zeros((weld.max() + 1, 3), dtype=np.float64)
     for k in range(3):
         np.add.at(acc, Fw[:, k], fn)
@@ -116,6 +136,64 @@ def _smooth_normals(P: np.ndarray, F: np.ndarray) -> np.ndarray:
     ln = np.linalg.norm(n, axis=1, keepdims=True)
     return np.divide(n, ln, out=np.tile(np.array([0.0, 1.0, 0.0]), (len(n), 1)),
                      where=ln > 1e-20)
+
+
+def _guided_normals(P: np.ndarray, F: np.ndarray, weld: np.ndarray, fn: np.ndarray,
+                    guide: np.ndarray, hard_edge_deg: float) -> Optional[np.ndarray]:
+    """`_smooth_normals` restricted to smoothing groups: each split vertex sums the area-weighted
+    normals of the faces around its POSITION whose own corner carries a compatible guide normal.
+    Returns None when the guide is unusable (the caller then smooths across everything)."""
+    g = np.asarray(guide, dtype=np.float64)
+    if g.shape != P.shape or not np.isfinite(g).all():
+        return None
+    gl = np.linalg.norm(g, axis=1, keepdims=True)
+    if (gl < 1e-6).mean() > 0.01:
+        return None
+    g = np.divide(g, gl, out=np.zeros_like(g), where=gl > 1e-6)
+    cos_t = float(np.cos(np.radians(hard_edge_deg)))
+    # corners grouped by welded position (CSR)
+    cv = F.reshape(-1)                                   # split vertex of each corner
+    cf = np.repeat(np.arange(len(F)), 3)
+    cw = weld[cv]
+    order = np.argsort(cw, kind="stable")
+    start = np.searchsorted(cw[order], np.arange(int(weld.max()) + 2))
+    c_vert, c_face = cv[order], cf[order]
+    acc = np.zeros(P.shape, dtype=np.float64)
+    deg = start[weld + 1] - start[weld]                  # corners at each vertex's position
+    # chunks of similar width, so one high-valence pole does not pad every row
+    vorder = np.argsort(deg, kind="stable")
+    CH = 1 << 15
+    for s in range(0, len(P), CH):
+        vs = vorder[s:s + CH]
+        width = int(deg[vs].max()) if len(vs) else 0
+        if width == 0:
+            continue
+        st = start[weld[vs]]
+        cols = np.arange(width)
+        ok = cols[None, :] < deg[vs][:, None]
+        idx = np.minimum(st[:, None] + cols[None, :], len(c_vert) - 1)
+        agree = (g[c_vert[idx]] * g[vs][:, None, :]).sum(-1) > cos_t
+        acc[vs] = (fn[c_face[idx]] * (ok & agree)[..., None]).sum(1)
+    ln = np.linalg.norm(acc, axis=1, keepdims=True)
+    # a vertex whose group cancelled (or found nothing) keeps its guide: finite and authored
+    return np.where(ln > 1e-20, acc / np.maximum(ln, 1e-30), g)
+
+
+def _low_basis_normals(P: np.ndarray, F: np.ndarray, carried: Optional[np.ndarray]) -> np.ndarray:
+    """The low-poly NORMAL the map is baked against (and written with).
+
+    The normals the decimator CARRIED from the source when there are any: they hold whatever the
+    artist authored — hard edges, weighted / custom normals on a bevelled kit piece — and the bake
+    only has to encode what the decimation removed. Recomputing them from the coarse geometry
+    throws that away and makes the map re-encode it, at 8 bits and the map's resolution: on a
+    real wall kit the shading error vs the source rose from 3.8 deg to 8.6 deg (p50) that way.
+    Without carried normals, smooth ones (hard-edge aware where possible, see `_smooth_normals`)."""
+    if carried is not None:
+        c = np.asarray(carried, dtype=np.float64)
+        ln = np.linalg.norm(c, axis=1, keepdims=True)
+        if c.shape == P.shape and np.isfinite(c).all() and (ln > 1e-6).all():
+            return c / ln
+    return _smooth_normals(P, F, guide=carried)
 
 
 def _tangents(P: np.ndarray, F: np.ndarray, UV: np.ndarray, N: np.ndarray) -> np.ndarray:
@@ -244,16 +322,46 @@ def bake_normal_map(
     src_normal_map: Optional[np.ndarray],
     P_lo: np.ndarray, F_lo: np.ndarray, UV_lo: np.ndarray,
     res: int,
+    N_lo_guide: Optional[np.ndarray] = None,
+    src_normal_scale: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """Bake `P_hi`'s surface detail into a tangent-space normal map for `P_lo`.
 
     Returns `(rgb uint8 (res, res, 3), low-poly NORMAL (n, 3), low-poly TANGENT (n, 4), stats)`.
     The returned normal/tangent MUST be written onto the low-poly primitive: the map is only valid
-    in the basis it was baked against.
+    in the basis it was baked against. `N_lo_guide` keeps the low-poly's hard edges (see
+    `_smooth_normals`); `src_normal_scale` is the source material's `normalTexture.scale`.
     """
+    rgb, covered, N_lo, T4_lo, stats = bake_texels(
+        P_hi, F_hi, UV_hi, N_hi, TAN_hi, src_normal_map, P_lo, F_lo, UV_lo, res,
+        N_lo_guide=N_lo_guide, src_normal_scale=src_normal_scale)
+    return finish_map(rgb, covered), N_lo, T4_lo, stats
+
+
+def finish_map(rgb: np.ndarray, covered: np.ndarray) -> np.ndarray:
+    """Dilate baked texels past their island borders and quantize to uint8. Texels the dilation
+    does not reach stay a flat (0.5, 0.5, 1) normal."""
+    rgb = rgb.astype(np.float32).copy()
+    rgb[~covered] = (0.5, 0.5, 1.0)
+    rgb = _dilate(rgb, covered)
+    return np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8)
+
+
+def bake_texels(
+    P_hi: np.ndarray, F_hi: np.ndarray, UV_hi: np.ndarray,
+    N_hi: Optional[np.ndarray], TAN_hi: Optional[np.ndarray],
+    src_normal_map: Optional[np.ndarray],
+    P_lo: np.ndarray, F_lo: np.ndarray, UV_lo: np.ndarray,
+    res: int,
+    N_lo_guide: Optional[np.ndarray] = None,
+    src_normal_scale: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
+    """`bake_normal_map` without the dilation: returns (rgb float32 (res, res, 3) in 0..1, covered
+    bool (res, res), NORMAL, TANGENT, stats). Several primitives sharing one material bake into
+    one map by compositing their covered texels and calling `finish_map` once."""
     import igl
 
-    N_lo = _smooth_normals(P_lo, F_lo)
+    N_lo = _low_basis_normals(P_lo, F_lo, N_lo_guide)
     T4_lo = _tangents(P_lo, F_lo, UV_lo, N_lo)
     T_lo = T4_lo[:, :3]
     B_lo = np.cross(N_lo, T_lo) * T4_lo[:, 3:4]
@@ -291,7 +399,7 @@ def bake_normal_map(
     Bt -= Nt * (Nt * Bt).sum(1, keepdims=True) + Tt * (Tt * Bt).sum(1, keepdims=True)
     Bt /= np.linalg.norm(Bt, axis=1, keepdims=True) + 1e-20
 
-    eps = max(CAGE_FRAC * float(P_hi[:, 1].max() - P_hi[:, 1].min()), 1e-5)
+    eps = max(CAGE_FRAC * float((P_hi.max(0) - P_hi.min(0)).max()), 1e-5)
     tree = igl.AABB()
     tree.init(P_hi, F_hi)
     Fh64 = F_hi.astype(np.int64)
@@ -351,6 +459,8 @@ def bake_normal_map(
     if src_normal_map is not None:
         uv_hit = (UV_hi[cor] * wgt[:, :, None]).sum(1)
         ts = _sample_bilinear(src_normal_map, uv_hit) * 2.0 - 1.0
+        if src_normal_scale != 1.0:          # glTF: the scale multiplies the sampled X and Y
+            ts[:, :2] *= float(src_normal_scale)
         th = (T_hi[cor] * wgt[:, :, None]).sum(1)
         bh = (B_hi[cor] * wgt[:, :, None]).sum(1)
         n_world = (th * ts[:, 0:1] + bh * ts[:, 1:2] + n_world * ts[:, 2:3])
@@ -377,8 +487,6 @@ def bake_normal_map(
     rgb[ys, xs] = (ts_out * 0.5 + 0.5).astype(np.float32)
     covered = np.zeros((res, res), dtype=bool)
     covered[ys, xs] = True
-    rgb = _dilate(rgb, covered)
-    out = np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8)
 
     stats = {
         "resolution": int(res),
@@ -387,7 +495,7 @@ def bake_normal_map(
         "cage_hit_rate": float(hit.mean()),
         "composed_with_source_map": src_normal_map is not None,
     }
-    return out, N_lo.astype(np.float32), T4_lo.astype(np.float32), stats
+    return rgb, covered, N_lo.astype(np.float32), T4_lo.astype(np.float32), stats
 
 
 def encode_png(rgb: np.ndarray) -> bytes:
@@ -397,6 +505,26 @@ def encode_png(rgb: np.ndarray) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(buf, format="PNG", optimize=False, compress_level=6)
     return buf.getvalue()
+
+
+# Lossy WebP quality for a baked map whose source map was lossy WebP. Measured on a real 1024 kit
+# map: q90 is 112 KB at 1.0 deg p50 / 5.2 deg p95 normal error, lossless is 475 KB, PNG 604 KB.
+WEBP_QUALITY = 90
+
+
+def encode_map(rgb: np.ndarray, like: Optional[bytes] = None) -> Tuple[bytes, str]:
+    """Encode a baked map the way the map it replaces was encoded: WebP when the source normal map
+    was WebP (lossy if it was lossy, lossless if it was lossless), PNG otherwise — never JPEG.
+    A pipeline that already ships compressed WebP keeps its codec and its file sizes; writing PNG
+    there doubled a 450 KB prop. Returns (bytes, mime type)."""
+    if like is not None and like[:4] == b"RIFF" and like[8:12] == b"WEBP":
+        from PIL import Image
+        lossless = like[12:16] == b"VP8L"
+        buf = io.BytesIO()
+        Image.fromarray(rgb, mode="RGB").save(buf, format="WEBP", lossless=lossless,
+                                              quality=100 if lossless else WEBP_QUALITY, method=6)
+        return buf.getvalue(), "image/webp"
+    return encode_png(rgb), "image/png"
 
 
 def decode_image(raw: bytes) -> Optional[np.ndarray]:
@@ -434,3 +562,41 @@ def _texture_image_index_compat(g, tex_index):
         return tex.source
     src = ((tex.extensions or {}).get("EXT_texture_webp") or {}).get("source")
     return int(src) if src is not None else None
+
+
+def shade_at(Q: np.ndarray, P: np.ndarray, F: np.ndarray, UV: Optional[np.ndarray],
+             N: np.ndarray, TAN: Optional[np.ndarray], nmap: Optional[np.ndarray],
+             scale: float = 1.0) -> np.ndarray:
+    """The normal a renderer shows at the surface point of (P, F) nearest each Q: the interpolated
+    vertex normal, perturbed by the tangent-space map when there is one. Tangents missing from the
+    mesh are generated, as a renderer would."""
+    import igl
+    F = np.asarray(F, dtype=np.int64)
+    _, fid, pts = igl.point_mesh_squared_distance(np.asarray(Q, np.float64),
+                                                  np.asarray(P, np.float64), F)
+    fid = np.asarray(fid, dtype=np.int64)
+    tri = P[F[fid]]
+    v0, v1, v2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], np.asarray(pts) - tri[:, 0]
+    d00, d01, d11 = (v0 * v0).sum(1), (v0 * v1).sum(1), (v1 * v1).sum(1)
+    d20, d21 = (v2 * v0).sum(1), (v2 * v1).sum(1)
+    den = np.where(np.abs(d00 * d11 - d01 * d01) < 1e-20, 1e-20, d00 * d11 - d01 * d01)
+    b = (d11 * d20 - d01 * d21) / den
+    c = (d00 * d21 - d01 * d20) / den
+    w = np.stack([1 - b - c, b, c], axis=1)
+    cor = F[fid]
+    N = np.asarray(N, dtype=np.float64)
+    n = (N[cor] * w[:, :, None]).sum(1)
+    n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20
+    if nmap is not None and UV is not None:
+        if TAN is None:
+            TAN = _tangents(np.asarray(P, np.float64), F, np.asarray(UV, np.float64), N)
+        TAN = np.asarray(TAN, dtype=np.float64)
+        t = (TAN[cor, :3] * w[:, :, None]).sum(1)
+        t -= n * (n * t).sum(1, keepdims=True)
+        t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-20
+        bt = np.cross(n, t) * np.sign((TAN[cor, 3] * w).sum(1))[:, None]
+        ts = _sample_bilinear(nmap, (np.asarray(UV, np.float64)[cor] * w[:, :, None]).sum(1)) * 2 - 1
+        ts[:, :2] *= float(scale)
+        n = t * ts[:, 0:1] + bt * ts[:, 1:2] + n * ts[:, 2:3]
+        n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20
+    return n

@@ -31,42 +31,38 @@ import io
 import os
 
 import numpy as np
-from pygltflib import GLTF2
 
 from ..decimate import _closest_on_triangles, _gather_incident, _incident_faces, _uv_islands
-from ..gltf_io import _acc
 
 
 def read_mesh(path: str) -> dict:
-    """First triangle primitive with UVs, plus the decoded base-colour image."""
-    g = GLTF2().load(path)
-    blob = g.binary_blob()
-    for mesh in (g.meshes or []):
-        for prim in mesh.primitives:
-            at = prim.attributes
-            if at.POSITION is None or at.TEXCOORD_0 is None:
-                continue
-            uv = _acc(g, blob, at.TEXCOORD_0)
-            if np.issubdtype(uv.dtype, np.integer):
-                uv = uv.astype(np.float64) / np.iinfo(uv.dtype).max
-            F = (_acc(g, blob, prim.indices).astype(np.int64).reshape(-1, 3)
-                 if prim.indices is not None
-                 else np.arange(g.accessors[at.POSITION].count).reshape(-1, 3))
-            out = {"P": _acc(g, blob, at.POSITION).astype(np.float64),
-                   "UV": uv.astype(np.float64), "F": F, "tex": None, "tex_size": 2048}
-            mat = g.materials[prim.material] if prim.material is not None else None
-            pbr = mat.pbrMetallicRoughness if mat is not None else None
-            if pbr is not None and pbr.baseColorTexture is not None:
-                img = g.images[g.textures[pbr.baseColorTexture.index].source]
-                if img.bufferView is not None:
-                    from PIL import Image
-                    bv = g.bufferViews[img.bufferView]
-                    off = bv.byteOffset or 0
-                    im = Image.open(io.BytesIO(bytes(blob[off:off + bv.byteLength]))).convert("RGB")
-                    out["tex"] = np.asarray(im, dtype=np.float64) / 255.0
-                    out["tex_size"] = max(im.size)
-            return out
-    raise ValueError(f"{path}: no textured triangle primitive")
+    """Every textured triangle primitive in world space, concatenated, plus the decoded
+    base-colour image of the first one that has it (its size is the texel unit)."""
+    from ..gltf_io import concat_triangles, load_triangles
+    g, blob, prims = load_triangles(path)
+    prims = [p for p in prims if p["UV"] is not None]
+    if not prims:
+        raise ValueError(f"{path}: no textured triangle primitive")
+    c = concat_triangles(prims, keys=("UV",))
+    out = {"P": c["P"], "UV": c["UV"], "F": c["F"], "tex": None, "tex_size": 2048}
+    from ..bake_normals import _texture_image_index_compat
+    for p in prims:
+        mat = g.materials[p["material"]] if (p["material"] is not None and g.materials) else None
+        pbr = mat.pbrMetallicRoughness if mat is not None else None
+        if pbr is None or pbr.baseColorTexture is None:
+            continue
+        ii = _texture_image_index_compat(g, pbr.baseColorTexture.index)
+        img = g.images[ii] if (ii is not None and g.images and ii < len(g.images)) else None
+        if img is None or img.bufferView is None:
+            continue
+        from PIL import Image
+        bv = g.bufferViews[img.bufferView]
+        off = bv.byteOffset or 0
+        im = Image.open(io.BytesIO(bytes(blob[off:off + bv.byteLength]))).convert("RGB")
+        out["tex"] = np.asarray(im, dtype=np.float64) / 255.0
+        out["tex_size"] = max(im.size)
+        break
+    return out
 
 
 def uv_drift(src: dict, lo: dict, k: int = 6) -> np.ndarray:
