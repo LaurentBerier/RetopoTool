@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retopotool"
+version = "0.1.0"
+description = "Seam-preserving GLB decimation, normal-map bake and skin-preserving LOD ladders for game characters."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Laurent Bernier" }]
+requires-python = ">=3.10"
+keywords = ["gltf", "glb", "decimation", "lod", "retopology", "normal-map", "mesh"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pygltflib>=1.16",
+    # needs simplify(return_collapses=True) + replay_simplification
+    "fast-simplification>=0.1.13,<0.2",
+    # the bake relies on the 2.6 binding signatures of AABB / point_mesh_squared_distance
+    "libigl==2.6.2",
+    "Pillow>=10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+retopo = "retopotool.cli:main"
+
+[project.urls]
+Repository = "https://github.com/LaurentBerier/RetopoTool"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
